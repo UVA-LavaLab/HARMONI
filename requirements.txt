@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+seaborn
+networkx
+pydot
+graphviz
+openpyxl
+tqdm

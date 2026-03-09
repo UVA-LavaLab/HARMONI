@@ -13,7 +13,7 @@ EOF
 }
 
 # ===============================
-# User-editable configuration
+# User-editable configuration (Please edit this before ./run_ae.sh)
 # ===============================
 
 # Launch mode used when no CLI mode is passed to this wrapper.
@@ -25,7 +25,7 @@ SLURM_EMAIL=""               # e.g., your_id@university.edu
 SLURM_PARTITION=""           # e.g., standard/cpu
 # Optional:
 SLURM_ALLOCATION=""          # e.g., your_allocation (SBATCH -A option)
-SLURM_ONLY=""                # one of: small, mid, large, large1, large2
+SLURM_ONLY=""                # empty => run all cases; else one of: small, mid, large, large1, large2
 
 # LOCAL mode:
 # Optional: empty means run all sizes.
@@ -48,15 +48,10 @@ fi
 
 MODE="${1:-$DEFAULT_LAUNCH_MODE}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${HARMONI_HOME:-$SCRIPT_DIR}"
-
-if [[ ! -d "$REPO_DIR" ]]; then
-  echo "Error: HARMONI directory not found: $REPO_DIR"
+if [[ ! -f "run.py" ]]; then
+  echo "Error: run.py not found. Run this script from HARMONI repo root."
   exit 1
 fi
-
-cd "$REPO_DIR"
 
 case "$MODE" in
   slurm)

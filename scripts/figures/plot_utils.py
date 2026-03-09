@@ -7,9 +7,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 
-# Set Times New Roman font globally
+# Prefer Times family but include portable serif fallbacks.
+SERIF_FONT_FALLBACKS = [
+    "Times New Roman",
+    "Times",
+    "Nimbus Roman No9 L",
+    "Liberation Serif",
+    "DejaVu Serif",
+]
+
+# Set serif font globally.
 plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['font.serif'] = SERIF_FONT_FALLBACKS
 plt.rcParams['mathtext.fontset'] = 'stix'  # For math symbols
 
 
@@ -35,7 +44,7 @@ def apply_paper_rcparams(compact: bool = False):
             "ytick.labelsize": base_font - 1,
             "legend.fontsize": base_font - 1,
             "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "Nimbus Roman"],
+            "font.serif": SERIF_FONT_FALLBACKS,
             "mathtext.fontset": "stix",
             # Lines / spines / ticks (thicker than defaults for small figs)
             "axes.linewidth": 0.7,

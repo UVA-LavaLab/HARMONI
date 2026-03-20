@@ -140,7 +140,13 @@ def GEMV_latency_energy(N, K, dram):
     # Assuming we use GEMV unit to do GEMV
     N_per_bank = math.ceil(N / dram.total_banks)
     num_DRAM_rows_per_bank = math.floor(N_per_bank * Data_width * K / page_size)
-    num_tail_cols = math.ceil((N_per_bank*Data_width - (num_DRAM_rows_per_bank * page_size)) / dram.bank_interface)
+    num_tail_cols = math.ceil((N_per_bank*Data_width*K - (num_DRAM_rows_per_bank * page_size)) / dram.bank_interface)
+
+    #integer-safe version
+    # total_bits_per_bank = N_per_bank * DATA_WIDTH * K
+    # num_DRAM_rows_per_bank = total_bits_per_bank // page_size
+    # rem_bits = total_bits_per_bank % page_size
+    # num_tail_cols = (rem_bits + dram.bank_interface - 1) // dram.bank_interface
 
     adder_tree_width_per_chip = dram.total_banks
 

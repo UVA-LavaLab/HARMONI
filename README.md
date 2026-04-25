@@ -64,3 +64,6 @@ python3 run.py \
     --fused_attn \
     --optimization layer static_mapping \
 ```
+## Paper
+
+[Read here](https://github.com/UVA-LavaLab/HARMONI/blob/main/HARMONI_ISPASS2026.pdf)

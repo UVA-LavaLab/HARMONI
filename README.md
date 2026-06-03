@@ -64,6 +64,22 @@ python3 run.py \
     --fused_attn \
     --optimization layer static_mapping \
 ```
-## Paper
 
-[Read here](https://github.com/UVA-LavaLab/HARMONI/blob/main/HARMONI_ISPASS2026.pdf)
+## Publication
+**ISPASS 2026**  
+*HARMONI: Hierarchical ARchitecture MOdeling for LLMs with Near/In Memory Computing*  
+Khyati Kiyawat, Yasas Seneviratne, Zhenxing Fan, Morteza Baradaran, Kevin Skadron (University of Virginia) [[Paper]](https://doi.org/10.1109/ISPASS69572.2026.00016)  
+
+## Citation
+If you use HARMONI in your research, please cite: 
+
+```bibtex
+@inproceedings{kiyawat2026harmoni,
+  title={{HARMONI}: {H}ierarchical {AR}chitecture {MO}deling for {LLM}s with {N}ear/{I}n {M}emory {C}omputing},
+  author={Kiyawat, Khyati and Seneviratne, Yasas and Fan, Zhenxing and Baradaran, Morteza and Skadron, Kevin},
+  booktitle={2026 IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS)},
+  pages={51--63},
+  year={2026},
+  organization={IEEE}
+}
+```

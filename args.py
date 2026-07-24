@@ -44,7 +44,7 @@ def parse_args():
                        default=False)
     parser.add_argument('--systolic_height', type=int,  
                        help='Systolic array height (this is the max batch size supported)',
-                       default=8)
+                       default=16)
     parser.add_argument('--buffer', type=int,  
                        help='SRAM buffer size per center stripe',
                        default=262144)

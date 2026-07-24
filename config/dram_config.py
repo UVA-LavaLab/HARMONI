@@ -22,7 +22,7 @@ dram_table["DDR5-M4-R8-C4-8-A2"] = [4, 4, 4, 4, 8, 4, 8, 64, 8, 16, 128, 'RoChRa
 dram_table["DDR5-M4-R8-C8-8-A2"] = [4, 4, 4, 8, 8, 4, 8, 64, 8, 8, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 dram_table["DDR5-M4-R8-C16-8-A2"] = [4, 4, 4, 16, 8, 4, 8, 64, 8, 4, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 
-#Scale up for 70b
+#Scale up for 70b (TODO: recheck the burst length, shouldn't be 128/chip_interface)
 dram_table["DDR5-M16-R2-C4-8-A2"] = [16, 1, 1, 4, 8, 4, 8, 64, 8, 16, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 dram_table["DDR5-M16-R2-C8-8-A2"] = [16, 1, 1, 8, 8, 4, 8, 64, 8, 8, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 dram_table["DDR5-M16-R4-C4-8-A2"] = [16, 2, 2, 4, 8, 4, 8, 64, 8, 16, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
@@ -34,6 +34,11 @@ dram_table["DDR5-M16-R8-C8-8-A2"] = [16, 4, 4, 8, 8, 4, 8, 64, 8, 8, 128, 'RoChR
 dram_table["DDR4-M8-R4-C8-8-A2"] = [8, 2, 2, 8, 4, 4, 8, 128, 8, 8, 64, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 #repeat dram_table["DDR5-M8-R4-C8-8-A2"] = [8, 2, 2, 8, 8, 4, 8, 64, 8, 8, 128, 'RoChRaCoBgBaBt', 'AB', 2.5, 5, 46.6, 32.5, 13.75]
 dram_table["GDDR6-M8-R4-C8-8-A2"] = [8, 2, 2, 8, 8, 4, 8, 32, 8, 8, 256, 'RoChRaCoBgBaBt', 'AB', 1, 2, 43, 32.5, 13.75]
+
+#micro 2026
+dram_table["GDDR6-M2-R4-C8-16-A2"] = [2, 2, 2, 8, 8, 4, 16, 64, 16, 16, 256, 'RoChRaCoBgBaBt', 'AB', 1, 2, 43, 32.5, 13.75]
+dram_table["GDDR6-M8-R4-C8-16-A2"] = [8, 2, 2, 8, 8, 4, 16, 64, 16, 16, 256, 'RoChRaCoBgBaBt', 'AB', 1, 2, 43, 32.5, 13.75]
+dram_table["GDDR6-M4-R4-C8-16-A2"] = [4, 2, 2, 8, 8, 4, 16, 64, 16, 16, 256, 'RoChRaCoBgBaBt', 'AB', 1, 2, 43, 32.5, 13.75]
 
 def get_all_dram_names():
     """Return a list of all available DRAM configuration names."""

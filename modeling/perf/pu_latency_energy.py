@@ -10,21 +10,12 @@ num_banks_per_systolic_array = 1
 # Number of bits in a data element
 Data_width = 16 
 #NOTE: use this: #get_bytes_per_element(args.dtype, HarmoniTensorType.ACT), check type.py for datatype enums, dtype is part of args = parse_args()
+is_PNM = True
 
 # Compute unit configuration
 compute_CC = 1 # Assuming 1GHz for compute units, clock cycle = 1ns
-ADD_cycle = 1 # assuming 1 cycles for each addition
-MUL_cycle = 2 # assuming 2 cycles for each multiplication
-EXP_cycle = 12 # assuming 12 cycle for each exponentiation
-COMP_cycle = 1 # assuming 1 cycle for each comparison
-DIV_cycle = 8 # assuming 8 cycle for each division
-SQRT_cycle = 11 # assuming 11 cycle for each square root
-
-# Global config
-max_tree_width_per_chip = 64 # assuming a 64to1 softmax unit per chip
-adder_tree_width_per_rank = 128 # assuming a 128to1 adder tree unit per rank
-exp_width_per_chip = 32 # assuming a 32-lane SIMD exp unit per chip 
-adder_width_per_chip = 32 # assuming a 32-lane SIMD adder unit per chip
+ADD_cycle = 2 # assuming 2 cycles for each addition
+MUL_cycle = 3 # assuming 3 cycles for each multiplication
 
 # Energy breakdown tracking functions
 def create_energy_stats():
@@ -33,15 +24,17 @@ def create_energy_stats():
         'systolic_array': 0.0,
         'sram_buffer': 0.0, 
         'adder_tree': 0.0,
+        'accumulator': 0.0,
+        'dram_background': 0.0,
         'dram_read': 0.0,
         'dram_write': 0.0,
         'dram_activate': 0.0,
         'simd_multiplier': 0.0,
         'simd_adder': 0.0,
         'max_tree': 0.0,
-        'exp_unit': 0.0,
-        'divider_unit': 0.0,
-        'sqrt_unit': 0.0,
+        'SOFTMAX_unit': 0.0,
+        'actv_unit': 0.0,
+        'RMSNorm_unit': 0.0,
         'center_stripe_logic': 0.0,
         'dram_chiplet': 0.0,
         'comm': 0.0 
@@ -59,50 +52,63 @@ def aggregate_energy_stats(energy_stats_list):
     
     return aggregated
 
-#NOTE: We only have Voltage and current values for DDR5
-# https://github.com/CMU-SAFARI/ramulator2/blob/main/src/dram/impl/DDR5.cpp
-# V * mA * ns = pJ
-VDD = 1.1 # V
-IDD0 = 60 # mA
-IDD2N = 50 # mA
-IDD3N = 55 # mA
-IDD4R = 145 # mA
-IDD4W = 145 # mA
-BL = 8 * 0.625 # ns
+#TODO: use dram config to determine STD
+STD = "GDDR6" 
+
+if STD == "DDR5":
+    #NOTE: We only have Voltage and current values for DDR5
+    # https://github.com/CMU-SAFARI/ramulator2/blob/main/src/dram/impl/DDR5.cpp
+    # V * mA * ns = pJ
+    VDD = 1.1 # V
+    IDD0 = 60 # mA
+    IDD2N = 50 # mA
+    IDD3N = 55 # mA
+    IDD4R = 145 # mA
+    IDD4W = 145 # mA
+elif STD == "GDDR6":
+    #Did not find values for 16Gb GDDR6 (so scaling accordingly with reference to 8Gb GDDR6: https://github.com/umd-memsys/DRAMsim3/blob/master/configs/GDDR6_8Gb_x16.ini)
+    VDD = 1.35 # V
+    IDD0 = 1196 # mA (Act/Pre: +15% larger row decoders)
+    IDD2N = 838 # mA (Pre Standby: +25% higher transistor leakage)
+    IDD3N = 1437 # mA (Act Standby: +25% higher transistor leakage)
+    IDD4R = 3100 # mA (Burst read: +5% mostly IO bound)
+    IDD4W = 3320 # mA (Burst write: +5% mostly IO bound)
 
 # https://github.com/umd-memsys/DRAMsim3/blob/29817593b3389f1337235d63cac515024ab8fd6e/src/configuration.cc#L203
 def act_energy_per_bank(dram):
     # Energy per chip per active operation
-    #act_energy_per_bank = VDD * (IDD0 * dram.tRC - (IDD3N * dram.tRAS + IDD2N * dram.tRP))
-    act_energy_per_bank = VDD * (IDD0 * dram.tRC) #adding background energy
+    act_energy_per_bank = VDD * (IDD0 * dram.tRC - (IDD3N * dram.tRAS + IDD2N * dram.tRP)) #background power doesn't need to be multplied by the number of banks (IDD3N is already accounting for all bank active current). But it also doesn't effect by the 0.34% ratio, so we separate it our from rea/write/act calculation)
+    #act_energy_per_bank = VDD * (IDD0 * dram.tRC) #adding background energy
     return act_energy_per_bank
 
 def read_energy_per_bank(dram):
     # Energy per chip per read operation
     # SIO, LIO, and GIO: 31%, column operations: 20%, CSL: 10%, cite 1810_Ha_DRAMEnergy
     #read_energy_per_bank = VDD * (IDD4R - IDD3N) * BL * (0.31 + 0.1 + 0.2)
-    #read_energy_per_bank = VDD * (IDD4R - IDD3N) * dram.tCCDs * (0.2 + 0.1 + 0.04) 
-    read_energy_per_bank = VDD * IDD4R * dram.tCCDs * (0.2 + 0.1 + 0.04) # adding background energy
+    read_energy_per_bank = VDD * (IDD4R - IDD3N) * dram.tCCDs * (0.2 + 0.1 + 0.04) 
+    #read_energy_per_bank = VDD * IDD4R * dram.tCCDs * (0.2 + 0.1 + 0.04) # adding background energy
     return read_energy_per_bank
 
 def write_energy_per_bank(dram):
     # Energy per chip per write operation
     #write_energy_per_bank = VDD * (IDD4W - IDD3N) * BL * (0.31 + 0.1 + 0.2)
-    #write_energy_per_bank = VDD * (IDD4W - IDD3N) * dram.tCCDs * (0.2 + 0.1 + 0.04) 
-    write_energy_per_bank = VDD * IDD4W * dram.tCCDs * (0.2 + 0.1 + 0.04) # adding background energy
+    write_energy_per_bank = VDD * (IDD4W - IDD3N) * dram.tCCDs * (0.2 + 0.1 + 0.04) 
+    #write_energy_per_bank = VDD * IDD4W * dram.tCCDs * (0.2 + 0.1 + 0.04) # adding background energy
     return write_energy_per_bank
 
 
 def memory_access_energy(rows, cols, dram):
     read_row_energy = cols * read_energy_per_bank(dram) + act_energy_per_bank(dram)
     total_read_energy = read_row_energy * rows
+    return total_read_energy
 
 def IS_GEMM_latency_energy(N, K, dram, systolic_height):
+    systolic_width = dram.bank_interface // Data_width
     N_per_chip = N
     adder_tree_width_per_chip = dram.total_banks 
     page_size = dram.csl_lines * dram.bank_interface
 
-    num_DRAM_rows_per_chunk = math.floor(N_per_chip * Data_width * systolic_height / page_size)
+    num_DRAM_rows_per_chunk = math.floor(N_per_chip * Data_width * systolic_width / page_size)
     num_tail_cols = math.ceil((N_per_chip * Data_width * systolic_height - (num_DRAM_rows_per_chunk * page_size)) / dram.bank_interface)
 
     #NOTE: Pessimistic approach to consider the entire row
@@ -113,20 +119,21 @@ def IS_GEMM_latency_energy(N, K, dram, systolic_height):
     
     # Number of systolic array per conventional DRAM chip
     NSA_per_DRAMchip = dram.total_banks / num_banks_per_systolic_array 
-    num_chunks = math.ceil(K / (NSA_per_DRAMchip * systolic_height))
+    num_chunks = math.ceil(K / (NSA_per_DRAMchip * systolic_width))
 
     GEMM_latency = num_chunks * chunk_latency + math.log2(adder_tree_width_per_chip) * ADD_cycle * compute_CC + ADD_cycle * compute_CC
 
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
+    energy_stats['dram_background'] = num_chunks * chunk_latency * VDD * IDD3N
     energy_stats['dram_read'] = (dram.csl_lines * num_DRAM_rows_per_chunk + num_tail_cols) * num_chunks * dram.total_banks * read_energy_per_bank(dram)
     energy_stats['dram_activate'] = act_energy_per_bank(dram) * math.ceil(N_per_chip * Data_width * systolic_height / page_size) * num_chunks * dram.total_banks
     energy_stats['sram_buffer'] = get_power_constants()['SRAM_power'] * GEMM_latency
-    energy_stats['adder_tree'] = get_power_constants()['adder_tree'].get(dram.total_banks, 0) * dram.total_banks * GEMM_latency
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * GEMM_latency
+    energy_stats['adder_tree'] = get_power_constants()['adder_tree'].get(systolic_width, 0) * dram.total_banks * GEMM_latency
+    energy_stats['accumulator'] = get_power_constants()['accumulator_power'] * GEMM_latency
 
-    SA_power = get_power_constants()['systolic'][(C, systolic_height, 250)]#NOTE: for now, only DDR5 is supported (16 * 8 SA), but we can explore energy for other configurations
+    SA_power = get_power_constants()['systolic'][(C, systolic_height, 100)]
     energy_stats['systolic_array'] = SA_power * GEMM_latency * dram.total_banks
 
     GEMM_energy = sum(energy_stats.values())
@@ -157,6 +164,8 @@ def GEMV_latency_energy(N, K, dram):
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
+    
+    energy_stats['dram_background'] = W_latency * VDD * IDD3N
     energy_stats['dram_read'] = (dram.csl_lines * num_DRAM_rows_per_bank + num_tail_cols)* dram.total_banks * read_energy_per_bank(dram)
     energy_stats['dram_activate'] = act_energy_per_bank(dram) * math.ceil(N_per_bank * Data_width * K / page_size) * dram.total_banks
     energy_stats['sram_buffer'] = get_power_constants()['SRAM_power'] * GEMV_latency
@@ -170,212 +179,110 @@ def GEMV_latency_energy(N, K, dram):
 
 
 def SOFTMAX_latency_energy(L, dram):
-    # For a 128*2048 GEMV, it takes 2818 ns, assuming 1 GHz for softmax unit, we have 2818 cycles to compute softmax
-
-    # to compute max(z)
-    max_tree_cycle = (L/max_tree_width_per_chip + math.log2(max_tree_width_per_chip) + 1) * COMP_cycle
-
-    # to compute z-max(z)
-    adder_cycle = ADD_cycle
-
-    # to compute exp(z-max(z))
-    exponential_cycle = L/exp_width_per_chip * EXP_cycle
-
-    adder_tree_width_per_chip = dram.total_banks
-    # to compute sum(exp(z-max(z)))
-    adder_tree_cycle = math.log2(adder_tree_width_per_chip) * ADD_cycle
+    input_lane = 32 
+    exp_cycle = 23
+    exp_lane = 32
+    max_tree_chip_width = 32
+    sum_tree_chip_width = 32
+    sub_lane = 32
+    reciprocal_cycle = 41
+    adder_cycle = 8
+    SOFTMAX_cycle = math.ceil (L/input_lane) + math.log2(max_tree_chip_width) + math.ceil(L/sub_lane) + math.ceil (L/exp_lane) + exp_cycle + math.log2(max_tree_chip_width) +  reciprocal_cycle + (L/input_lane) + adder_cycle
     
-    # to compute 1/sum(exp(z-max(z)))
-    div_cycle = DIV_cycle
+    SOFTMAX_latency = SOFTMAX_cycle * compute_CC
+    
+    SOFTMAX_power = get_power_constants()['SOFTMAX_unit_power']
+    SRAM_power = get_power_constants()['SRAM_power']
 
-    mul_width_per_bank = dram.bank_interface/Data_width
-    # to compute softmax(z) = exp(z-max(z)) / sum(exp(z-max(z)))
-    multiply_cycle = L/(mul_width_per_bank * dram.total_banks) * MUL_cycle
-
-    SOFTMAX_latency = (max_tree_cycle + adder_cycle + exponential_cycle + adder_tree_cycle + div_cycle + multiply_cycle) * compute_CC
+    SOFTMAX_energy  = SOFTMAX_latency * (SOFTMAX_power + SRAM_power) * 2 * math.ceil ( L / input_lane) * compute_CC
 
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
-
-    energy_stats['max_tree'] = get_power_constants()['max_tree_power'] * max_tree_cycle * compute_CC
-    energy_stats['exp_unit'] = get_power_constants()['exp_unit_power'] * exponential_cycle * compute_CC
-    energy_stats['divider_unit'] = get_power_constants()['divider_unit_power'] * div_cycle * compute_CC
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * multiply_cycle * compute_CC
-    energy_stats['adder_tree'] = get_power_constants()['adder_tree'].get(dram.total_banks, 0) * exponential_cycle * compute_CC
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * SOFTMAX_latency
+    energy_stats['SOFTMAX_unit'] = SOFTMAX_power * SOFTMAX_latency
+    energy_stats['sram_buffer'] = SRAM_power * SOFTMAX_latency
     
     SOFTMAX_energy = sum(energy_stats.values())
     return SOFTMAX_latency, SOFTMAX_energy, energy_stats
 
 
 def GeLU_latency_energy(L, dram):
-    # L stands for the total number of elements in the matrix
-    # to compute 0.044715 * x^3, mul, mul, mul const
-    mul_width_per_bank = dram.bank_interface/Data_width
-    num_DRAMchip = dram.num_chips_per_rank 
-    multiply_cycle1 = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle * 3
 
-    # to compute x + 0.044715 * x^3
-    add_cycle1 = ADD_cycle
-
-    # to compute sqrt(2/pi) * (x + 0.044715 * x^3)
-    multiply_cycle2 = MUL_cycle
-
-    # to compute tanh(sqrt(2/pi) * (x + 0.044715 * x^3))
-    # use tanh(x) = x − x^3/3 + 2x^5/15
-    multiply_cycle3 = MUL_cycle * (3 + 5)
-    add_cycle3 = ADD_cycle * 2
-
-    # to compute 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    multiply_cycle4 = MUL_cycle * 2
-    add_cycle4 = ADD_cycle
-
-    GeLU_latency = (multiply_cycle1 + add_cycle1 + multiply_cycle2 + multiply_cycle3 +
-                    add_cycle3 + multiply_cycle4 + add_cycle4) * compute_CC
+    actv_lane = 16
+    actv_cycle = 14
+    GeLU_cycle = math.ceil ( L / actv_lane) + actv_cycle
+    GeLU_latency = GeLU_cycle * compute_CC
+    GeLU_energy =  GeLU_latency * get_power_constants()['actv_unit_power']
 
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * (multiply_cycle1 + multiply_cycle2 + multiply_cycle3 + multiply_cycle4) * compute_CC
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * (add_cycle1 + add_cycle3 + add_cycle4) * compute_CC
+    energy_stats['actv_unit'] = get_power_constants()['actv_unit_power'] * GeLU_latency
     GeLU_energy = sum(energy_stats.values())
 
     return GeLU_latency, GeLU_energy, energy_stats
 
 
-def layer_norm_latency_energy(L, dram):
-    
-    mul_width_per_bank = dram.bank_interface/Data_width
-    num_DRAMchip = dram.num_chips_per_rank 
-    
-    # to compute mean(x)
-    adder_tree_cycle = (L/adder_tree_width_per_rank + math.log2(adder_tree_width_per_rank) + 1) * ADD_cycle
-    divide_cycle = DIV_cycle
-
-    # to compute x - mean(x), we broadcast mean(x) to all chips
-    add_cycle1 = ADD_cycle
-
-    # to compute (x - mean(x))^2
-    multiply_cycle1 = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle
-
-    # to compute sqrt((x - mean(x))^2)
-    sqrt_cycle = SQRT_cycle
-    # to compute 1/sqrt((x - mean(x))^2)
-    divide_cycle = DIV_cycle
-
-    # to compute (x - mean(x)) / sqrt((x - mean(x))^2)
-    multiply_cycle2 = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle
-
-    # to compute ri * (x - mean(x)) / sqrt((x - mean(x))^2)
-    multiply_cycle3 = MUL_cycle
-
-    # to compute ri * (x - mean(x)) / sqrt((x - mean(x))^2) + bi
-    add_cycle2 = ADD_cycle
-
-    layer_norm_latency = (adder_tree_cycle + divide_cycle + add_cycle1 + multiply_cycle1 +
-                          sqrt_cycle + divide_cycle + multiply_cycle2 + multiply_cycle3 +
-                          add_cycle2) * compute_CC
-
-    # Create energy stats dictionary
-    energy_stats = create_energy_stats()
-
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * (multiply_cycle1 + multiply_cycle2 + multiply_cycle3) * compute_CC
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * (adder_tree_cycle + add_cycle1 + add_cycle2) * compute_CC
-    energy_stats['divider_unit'] = get_power_constants()['divider_unit_power'] * (divide_cycle + divide_cycle) * compute_CC
-    energy_stats['sqrt_unit'] = get_power_constants()['square_root_unit_power'] * sqrt_cycle * compute_CC
-
-    layer_norm_energy = sum(energy_stats.values())
-
-    return layer_norm_latency, layer_norm_energy, energy_stats
-
 def RMSNorm_latency_energy(L, dram):
 
-    mul_width_per_bank = dram.bank_interface/Data_width
-    num_DRAMchip = dram.num_chips_per_rank 
+    num_DRAMchip = dram.num_chips_per_rank
+    chip_L = L / num_DRAMchip
+    input_lane = 16
+    adder_tree_chip_width = input_lane
+    adder_tree_CXL_ctrl_width = 64
+    mul_cycle = 3 # +1 +1 is multiply sum by 1/N and reciprocal square root look-up (pipelined)
+    RMSnorm_cycle =  math.ceil ( chip_L / input_lane) +  math.log2(adder_tree_chip_width) + math.log2( L / adder_tree_CXL_ctrl_width) + 1 + 1 + math.ceil ( chip_L / input_lane) + mul_cycle
+    RMSNorm_latency = RMSnorm_cycle * compute_CC
+    RMSNorm_power = get_power_constants()['RMSNorm_unit_power']
+    SRAM_power = get_power_constants()['SRAM_power']
+    RMSNorm_energy = RMSNorm_latency * (RMSNorm_power + SRAM_power) *  math.ceil ( chip_L / input_lane)
     
-    # to compute x^2
-    multiply_cycle1 = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle
-    
-    # to compute sum(x^2)
-    adder_tree_cycle = math.log2(adder_tree_width_per_rank) * ADD_cycle
-
-    # to computer sum(x^2) * 1/L
-    multiply_cycle2 = MUL_cycle
-
-    # to compute e + sum(x^2) * 1/L
-    add_cycle1 = ADD_cycle
-
-    # to compute r = sqrt(e + sum(x^2) * 1/L)
-    sqrt_cycle = SQRT_cycle
-    
-    # to computer 1/r
-    divide_cycle = DIV_cycle
-
-    # to computer x * 1/r
-    multiply_cycle3 = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle
-
-    # to computer x * 1/r * w
-    multiply_cycle4 = MUL_cycle
-
-    #print("RMS: ")
-    RMSNorm_latency = (multiply_cycle1 + adder_tree_cycle + multiply_cycle2 + add_cycle1 +
-                       sqrt_cycle + divide_cycle + multiply_cycle3 + multiply_cycle4) * compute_CC 
-     
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * num_DRAMchip * dram.total_banks * (multiply_cycle1 + multiply_cycle2 + multiply_cycle3 + multiply_cycle4) * compute_CC
-    energy_stats['adder_tree'] = get_power_constants()['adder_tree'].get(32, 0) * adder_tree_cycle * (adder_tree_width_per_rank / 32) * compute_CC
-    energy_stats['divider_unit'] = get_power_constants()['divider_unit_power'] * (divide_cycle) * compute_CC
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * (add_cycle1) * compute_CC
-    energy_stats['sqrt_unit'] = get_power_constants()['square_root_unit_power'] * sqrt_cycle * compute_CC
+    energy_stats['RMSNorm_unit'] = RMSNorm_power * RMSNorm_latency
+    energy_stats['sram_buffer'] = SRAM_power * RMSNorm_latency
 
     RMSNorm_energy = sum(energy_stats.values())
     return RMSNorm_latency, RMSNorm_energy, energy_stats
 
 def SiLU_latency_energy(L, dram): 
-    
-    # to compute sigmoid(x) only requires multiplication and addition
-
-    mul_width_per_bank = dram.bank_interface/Data_width
     num_DRAMchip = dram.num_chips_per_rank 
-
-    sigmoid_cycle = L/num_DRAMchip/(mul_width_per_bank * dram.total_banks) * MUL_cycle + ADD_cycle
+    actv_lane = 16
+    actv_cycle = 14
+    chip_L = math.ceil ( L / num_DRAMchip) #hack
+    SiLU_cycle = math.ceil ( chip_L / actv_lane) + actv_cycle
+    SiLU_latency = SiLU_cycle * compute_CC
+    actv_power = get_power_constants()['actv_unit_power']
+    SiLU_energy =  SiLU_latency * actv_power
     
-    # to compute x * sigmoid(x)
-    multiply_cycle1 = MUL_cycle
-
-    SiLU_latency = (sigmoid_cycle + multiply_cycle1) * compute_CC 
-
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * num_DRAMchip * dram.total_banks * SiLU_latency
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * num_DRAMchip * sigmoid_cycle * compute_CC
+    energy_stats['actv_unit'] = actv_power * SiLU_latency
 
     SiLU_energy = sum(energy_stats.values())
 
     return SiLU_latency, SiLU_energy, energy_stats
 
 def Rotary_latency_energy(L, dram):
+
     # We pre-compute sin(theta) and cos(theta) and store them in DRAM
-    
-    mul_width_per_bank = dram.bank_interface/Data_width
-    num_DRAMchip = dram.num_chips_per_rank 
-    
-    # to compute x * cos(theta), y * sin(theta), x * sin(theta), and y * cos(theta)
-    multiply_cycle1 = L/(mul_width_per_bank * dram.total_banks) * MUL_cycle * 4 
-
-    # to compute x * sin(theta) + y * cos(theta) and x * cos(theta) - y * sin(theta)
-    add_cycle1 = ADD_cycle
-
-    Rotary_latency = (multiply_cycle1 + add_cycle1) * compute_CC 
+     
+    simd_mul_cycle = 3
+    simd_mul_width = dram.bank_interface/Data_width
+    RoPE_cycle = 2 * (math.ceil(L/simd_mul_width)) + simd_mul_cycle
+    Rotary_latency = RoPE_cycle * compute_CC
+    simd_mul_power = get_power_constants()['SIMD_multiplier_power']
+    simd_add_power = get_power_constants()['SIMD_adder_power']
+    SRAM_power = get_power_constants()['SRAM_power']
+    Rotary_energy =  Rotary_latency * (simd_mul_power + simd_add_power + SRAM_power)
     
     # Create energy stats dictionary
     energy_stats = create_energy_stats()
 
-    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * dram.total_banks * multiply_cycle1 * compute_CC
-    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * add_cycle1 * compute_CC
+    energy_stats['simd_multiplier'] = get_power_constants()['SIMD_multiplier_power'] * Rotary_latency
+    energy_stats['simd_adder'] = get_power_constants()['SIMD_adder_power'] * Rotary_latency
+    energy_stats['sram_buffer'] = SRAM_power * Rotary_latency
 
     Rotary_energy = sum(energy_stats.values())
 
@@ -383,15 +290,13 @@ def Rotary_latency_energy(L, dram):
 
 def ARGMAX_latency_energy(L, dram):
 
-    num_DRAMchip = dram.num_chips_per_rank 
-    # to compute max(x)
-    max_tree_cycle1 = (L/num_DRAMchip/max_tree_width_per_chip + math.log2(max_tree_width_per_chip) + 1) * COMP_cycle
+    num_DRAMchip = dram.num_chips_per_rank #hack
+    chip_L = math.ceil(L/num_DRAMchip)
+    max_tree_chip_width = 32
+    max_tree_CXL_ctrl_width = 64
+    argmax_cycle = math.ceil (chip_L / max_tree_chip_width) + math.log2(max_tree_chip_width) + math.log2(max_tree_CXL_ctrl_width)
 
-    #rank level max-tree width should be equal to num of chips
-    max_tree_width_per_rank = dram.num_chips_per_rank
-    max_tree_cycle2 = (math.log2(max_tree_width_per_rank) + 1) * COMP_cycle
-
-    ARGMAX_latency = (max_tree_cycle1 + max_tree_cycle2) * compute_CC 
+    ARGMAX_latency = argmax_cycle * compute_CC 
     
     # Create energy stats dictionary
     energy_stats = create_energy_stats()

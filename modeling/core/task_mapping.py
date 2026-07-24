@@ -102,7 +102,8 @@ def map_tasks_to_logic_units(model_dfg, memsys, dram, args=None):
             if 'static_mapping' in args.optimization:
                 kernel_type = task_attrs.get('type', '')
                 if kernel_type in [NodeType.RMSNORM, NodeType.SILU, NodeType.ARGMAX, NodeType.EWMUL]:
-                    lu = memsys.get_logic_unit_by_id({'channel': 0, 'wt_rank': 0})[0]
+                    #lu = memsys.get_logic_unit_by_id({'channel': 0, 'wt_rank': 0})[0]
+                    lu = memsys.get_logic_unit_by_id({'channel': 0})[0]
                     lu.add_task(task)
                     task_mappings[task].append(lu)
                     task_attrs['logic_unit'] = lu 

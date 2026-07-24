@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 # Default network constants (single source of truth)
 TOTAL_LANES = 128.0 #144 port switch
 BW_PER_LANE_GBPS = 8.0 #GBps
-PCIE_BW = 32.0 #GBps PCIE 6.0 x4
+PCIE_BW = 256.0 #GBps PCIE 6.0 x32
 UCIE_BW_PER_PIN_GBPS = 8.0 #GBps per pin
 DEFAULT_CHIP_INTERFACE = 8.0 #pins per chip (fallback)
 UCIE_BW = DEFAULT_CHIP_INTERFACE * UCIE_BW_PER_PIN_GBPS #GBps

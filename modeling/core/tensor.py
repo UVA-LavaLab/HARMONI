@@ -1,6 +1,6 @@
 from misc.type import *
 from utils.logging_util import logger
-from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, calculate_batch_round_robin_rank
+from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, calculate_batch_round_robin_rank, add_to_address_skipping_rank
 from collections import defaultdict
 import math
 import re
@@ -180,11 +180,17 @@ class HarmoniTensor:
             
             if tensor.chip_idx == -1: # Tensor is spread across all chips in the rank
                 chip = i % num_chips
-                addr = int(tensor.addr_offset) + int((i // num_chips) * chip_partition_size) 
+                step = int((i // num_chips) * chip_partition_size)
             else:
                 chip = tensor.chip_idx
-                addr = int(tensor.addr_offset) + int(i * chip_partition_size)
-            
+                step = int(i * chip_partition_size)
+
+            if tensor.tag == HarmoniTensorType.KV:
+                # KV rank is pinned by batch round-robin: carries must skip the Ra field, not spill into it
+                addr = add_to_address_skipping_rank(int(tensor.addr_offset), step, dram)
+            else:
+                addr = int(tensor.addr_offset) + step
+
             
             partition_mapping = get_mapping_from_dram(int(addr), dram, "weight" if tensor.tag == HarmoniTensorType.WEIGHT else "kv") #NOTE: Should also work for ACT tensor since get_mapping is not using rank_type. Also, get_mapping for ACT tensor is done later!
 

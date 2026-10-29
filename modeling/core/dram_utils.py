@@ -87,6 +87,20 @@ def get_rank_offset(dram):
     logger.debug(f"Rank offset calculation shift bits {shift_bits}, rank offset {1 << shift_bits}")
     return 1 << shift_bits
 
+def add_to_address_skipping_rank(addr_offset, delta, dram):
+    """
+    Returns addr_offset + delta with the Ra field held fixed: carries out of the bits below Ra
+    go to the bits above Ra instead. Used for KV tensors whose rank is pinned by batch round-robin.
+    """
+    rank_shift = get_rank_offset(dram).bit_length() - 1
+    rank_bits = int(math.ceil(math.log(dram.num_ranks_per_channel, 2)))
+    low_mask = (1 << rank_shift) - 1
+    rank = (addr_offset >> rank_shift) & ((1 << rank_bits) - 1)
+    # Remove Ra bits, add, then put the same Ra bits back
+    packed = ((addr_offset >> (rank_shift + rank_bits)) << rank_shift) | (addr_offset & low_mask)
+    packed += delta
+    return ((packed >> rank_shift) << (rank_shift + rank_bits)) | (rank << rank_shift) | (packed & low_mask)
+
 @lru_cache(maxsize=512)
 def calculate_interleaving_aware_offset_cached(request_number, dram, rank_type, chip_idx):
     """

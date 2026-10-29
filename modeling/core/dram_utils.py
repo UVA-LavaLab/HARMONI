@@ -32,7 +32,7 @@ def get_mapping_cached(addr_offset, addr_interleaving, rank_type, burst_length, 
         addr_offset >>= bits
         mapping[component] = value
     
-    # Return a copy to prevent sharing between different calls
+    #NOTE: lru_cache hands this same dict object to every caller with the same address; treat it as read-only
     return dict(mapping)
 
 def get_mapping(addr_offset, dram, rank_type): #CLEANUP: remove rank_type not getting used

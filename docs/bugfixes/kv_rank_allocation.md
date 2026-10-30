@@ -159,3 +159,100 @@ fixes only take effect after those pickles are deleted, or with `--no_cache`. Th
 filename (`utils/cache.py:get_model_dfg_cache_filename`) also ignores `--fused_attn` and
 `--fused_qkv`: `fusion_suffix` is computed but not used. As a result, runs that differ only
 in those flags share one pickle.
+
+---
+
+## Fix 3 — KV allocator gave two requests the same address
+
+**TL;DR:** The KV allocator pins `Ra` to the batch's KV rank, but it still divided the
+request number by `num_kv_ranks`, as if `Ra` had used up request bits. That discarded one
+request bit (two with 4 KV ranks). As a result, requests with the same `Co` in the same
+`num_kv`-aligned group of rows (`r // csl_lines`) shared an address, and every KV tensor's reservation
+collapsed to half (or a quarter) of the cells it was given. Pinned `Ra` now consumes no request bits.
+
+### Why it happened
+`calculate_interleaving_aware_offset_with_batch_round_robin` fills the fields from LSB to MSB
+(`Bt Ba Bg Co Ra Ch Ro`), taking bits from the request number for each one:
+
+```
+Co = r & (csl_lines - 1);  r >>= log2(csl_lines)
+Ra = num_wt + batch % num_kv           # pinned: does not depend on r
+r //= num_kv                           # <-- drops the low bit(s) of what is left
+Ch = r & (num_channels - 1); ...; Ro = ...
+```
+
+The dropped bit belongs to no field, so on `DDR5-M4-R4-C8-8-A2` (2 KV ranks, 64 columns)
+requests 0 and 64 both give `0x8000`, and 128 and 192 both give `0x18000`. With 4 KV ranks,
+four requests share each address. With 1 KV rank (`//= 1`) nothing was lost.
+
+### The fix
+```
+elif component == 'Ra':
+    Ra = num_wt + batch % num_kv       # pinned; consume no request bits
+```
+Request `r` now maps one-to-one to `(Co, Ch, Ro)` inside the batch's rank. This fix does not
+change the weight allocator (whose `Ra` really is taken from the request), `temp_tensor_kv`
+(explicit channel/rank allocator), or the shared `kv_request_counter` (Fix 4).
+Code: `modeling/core/dram_utils.py:calculate_interleaving_aware_offset_with_batch_round_robin`.
+
+### Validation
+`HARMONI_phase2_diag/alloc_check.py` logs every KV allocator call. Each (K or V) head group
+owns the requests from its call up to the next call, and each head owns them on its own
+chip. Every request is decoded to a cell `(Ch, Ra, chip, Ro, Co)`. The tool also runs
+`kv_check.py` (walked cells). Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B, batch 2, seq 1024:
+
+| Check | Before | After |
+|---|---|---|
+| Requests sharing an address with another request on the same KV rank | 131,072 | 0 |
+| Requests aliasing another request of the same tensor | 1,048,576 | 0 |
+| Distinct reserved cells | 1,048,576 | 2,097,152 |
+| Reserved cells shared by >1 tensor / off the target rank | 0 / 0 | 0 / 0 |
+| Walked cells outside the tensor's own reservation (Fix 5) | 1,572,864 | 1,048,576 |
+| KV row / column accesses, per-rank task counts | — | unchanged |
+| Weight digest, `temp_tensor_kv` addresses | — | identical |
+
+All 12 configs: aliasing goes to 0 everywhere and the reserved cells grow 2× (4× with
+4 KV ranks); nothing is shared or off-rank (at seq 16, batch 1, 8,192 reserved cells were
+shared between tensors before the fix). KV rows/cols, per-rank tasks, weights and
+`temp_tensor_kv` are unchanged in all 12. The 1-KV-rank config (`DDR5-M16-R2`) is identical in every metric.
+Except in the DDR4 control case below, walked cells shared by >1 tensor grow by the same
+factor: about 2× with 2 KV ranks (e.g.
+526,336 → 1,044,480 of 530,432 → 1,052,672 distinct) and about 4× with 4 KV ranks
+(`DDR5-M4-R8`: 534,528 → 2,088,960); they are unchanged with 1 KV rank. The walk now reaches
+distinct cells instead of collapsed ones, but it still runs into the next tensor's cells
+until Fix 5. `DDR4-M8-R4-C8-8-A2` is the control
+case: its walk step is exactly one request, so after this fix the walked cells equal the
+reserved cells (shared walked cells 4,177,920 → 0, walked outside reservation 4,194,304 → 0).
+
+Default run (`run.py --model_name LLAMA2-7B --dtype BF16 --dram DDR5-M4-R4-C8-8-A2 -i 32
+-o 16 --simulate --optimization layer static_mapping --fused_attn --fused_qkv --no_cache`):
+
+| Run | Tasks per rank | Latency before | Latency after |
+|---|---|---|---|
+| `-b 1` | unchanged (kv_rank 0 = 1648, kv_rank 1 = 0) | 31,832.268 µs | 31,712.120 µs |
+| `-b 2` | unchanged (1648 / 1648) | 43,505.984 µs | 43,383.915 µs |
+
+### Impact on results
+Small, for configs that stay within capacity (see the caveat below). KV row/column counts and task counts do not change. The DFG's KV locations used to
+crowd into channels 0–2, because aliased bases folded back onto the same channels. They now
+spread over all four channels (batch 1, layer 0: per-channel locations {768, 752, 128, 0} →
+{384, 632, 504, 128}), which lowers latency by about 0.3–0.4%. Before this fix, KV tensors
+had about half (or a quarter, with 4 KV ranks) of their reserved space. The cells
+the walker reports were never what the allocator reserved, and Fix 5 addresses that.
+
+**Do not produce results from this commit on its own; Fix 4 must land with it.** Because
+pinned `Ra` no longer consumes request bits, KV addresses now climb through `Ro` `num_kv`×
+faster. With the counter still shared by all KV ranks, the number of requests that fit before
+`Ro` wraps falls from `num_kv · 2^(Co+Ch+Ro)` to `2^(Co+Ch+Ro)`. A scan of all 120 configs in
+`params/*.txt` (`HARMONI_phase2_diag/rev/ro_overflow.py`) finds 0 that overflow before this fix
+and 3 after, all LLAMA2-7B on `DDR5-M1-R4-C8-8-A2` with batch 8:
+
+| Config | KV requests / capacity | Effect |
+|---|---|---|
+| `ispass_ae_large1.txt:12` (i 2048, o 2048) | 2.0× | batches 4–7 wrap onto batches 0–3 (same KV rank) |
+| `ispass_ae_small.txt:26` (i 2048, o 128) | 1.06× | wraps into cells unused on that rank; no collision |
+| `ispass_ae_large.txt:27` (i 128, o 2048) | 1.06× | wraps into cells unused on that rank; no collision |
+
+Fix 4 gives each KV rank its own counter, which halves the per-rank load (1.0×, exactly full, and 0.53×),
+so all three fit again. The `temp_tensor_kv` wrap (31 configs) does not depend on this fix
+and is also handled in Fix 4.

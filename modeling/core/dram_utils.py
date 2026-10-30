@@ -272,8 +272,7 @@ def calculate_interleaving_aware_offset_with_batch_round_robin(request_number, d
                 # Use the round-robin determined KV rank
                 rank_value = dram.num_wt_ranks_per_channel + target_kv_rank
                 components[component] = rank_value
-                # Adjust remaining request to account for rank selection
-                remaining_request //= dram.num_kv_ranks_per_channel
+                # Ra is pinned, so it consumes no request bits; dividing here made requests with the same Co in the same num_kv-aligned group of rows share an address
             else:
                 bits = bit_lengths[component]
                 max_value = 2**bits - 1

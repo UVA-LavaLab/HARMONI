@@ -318,6 +318,23 @@ def requests_before_wrap(dram, pinned_components):
         bits += int(math.ceil(math.log(num_values[component], 2)))
     return 2**bits
 
+@lru_cache(maxsize=None)
+def kv_request_address_step(dram):
+    """
+    Address delta between consecutive KV requests r and r+1 of the batch round-robin allocator (one Co step in
+    AB mode). get_tensor_locations walks KV tensors one request per chip-partition with this step, adding it with
+    add_to_address_skipping_rank. Checked against the allocator so the walk covers exactly the requests it reserved.
+    """
+    alloc = lambda r: calculate_interleaving_aware_offset_with_batch_round_robin(r, dram, "kv", batch_idx=0)
+    step = alloc(1) - alloc(0)
+    # Requests that cross into the next field (Co -> Ch -> Ro); the address walk must carry exactly like the allocator
+    per_co = requests_before_wrap(dram, ['Ra', 'Ch', 'Ro'])
+    per_row = requests_before_wrap(dram, ['Ra', 'Ro'])
+    for r in [1, per_co - 1, per_co, per_row - 1, per_row, per_row + per_co + 1]:
+        if add_to_address_skipping_rank(alloc(0), r * step, dram) != alloc(r):
+            raise ValueError(f"KV address walk does not follow the KV allocator for {dram.addr_interleaving} in {dram.mode} mode (request {r})")
+    return step
+
 def calculate_interleaving_aware_offset_with_explicit_channel_rank(request_number, dram, rank_type, target_channel, target_rank, chip_idx=-1):
     """
     Calculate address offset with explicit control over channel and rank allocation.

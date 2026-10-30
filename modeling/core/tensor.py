@@ -1,6 +1,6 @@
 from misc.type import *
 from utils.logging_util import logger
-from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, add_to_address_skipping_rank
+from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, add_to_address_skipping_rank, kv_request_address_step
 from collections import defaultdict
 import math
 
@@ -159,15 +159,20 @@ class HarmoniTensor:
         # Calculate number of partitions needed for this tensor
         num_partitions = math.ceil(tensor_size / partition_size)
         chip_partition_size = partition_size // num_chips    
+        # Address distance between consecutive chip-partitions. One KV chip-partition is one allocator request
+        # (one Co step, 0x100 on DDR5), not chip_partition_size address units (512 on DDR5, 1024 on GDDR6), which
+        # skipped columns and ran past the tensor's reservation into the next one. Weights keep chip_partition_size
+        # because their allocator orders fields differently (Co -> Ra -> Ch -> Ro); Fix 6 revisits them
+        addr_step = kv_request_address_step(dram) if tensor.tag == HarmoniTensorType.KV else chip_partition_size
              
         for i in range(num_partitions*num_chips):
             
             if tensor.chip_idx == -1: # Tensor is spread across all chips in the rank
                 chip = i % num_chips
-                step = int((i // num_chips) * chip_partition_size)
+                step = int((i // num_chips) * addr_step)
             else:
                 chip = tensor.chip_idx
-                step = int(i * chip_partition_size)
+                step = int(i * addr_step)
 
             if tensor.tag == HarmoniTensorType.KV:
                 # KV rank is pinned by batch round-robin: carries must skip the Ra field, not spill into it
@@ -209,11 +214,11 @@ class HarmoniTensor:
 
             if key not in partition_map:
                 # First time this key is seen: set size, start_addr, end_addr
-                partition_map[key] = (chip_partition_size, addr, addr + chip_partition_size) #NOTE: Do not get mapping from this partition end_addr 
+                partition_map[key] = (chip_partition_size, addr, addr + addr_step) #NOTE: Do not get mapping from this partition end_addr 
             else:
                 prev_size, start_addr, prev_end_addr = partition_map[key]
                 # Update size and end_addr
-                partition_map[key] = (prev_size + chip_partition_size, start_addr, addr + chip_partition_size)
+                partition_map[key] = (prev_size + chip_partition_size, start_addr, addr + addr_step)
 
         # Convert back to list of (location_dict, size, start_addr, end_addr)
         merged_locations = []

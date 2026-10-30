@@ -66,7 +66,9 @@ Mistral-7B and PHI3-7B (GQA), and seq 16 / 1024 / 8192.
 
 ### Impact on results
 KV column-access counts are unchanged. KV row-access counts rise about 1.8×,
-because each tensor now sits in fewer places with more rows in each.
+because each tensor now sits in fewer places with more rows in each. Row and column counts
+do not enter latency or energy (see Fix 5); Fix 1's latency change came from the task and
+location structure (KV tasks moving from both KV ranks onto one).
 Attention results produced before this fix had KV work spread over both
 KV ranks.
 
@@ -422,8 +424,10 @@ Energy and the prefill/decode split are identical as well.
     on top of batch 0's K cache. On `large1:12` the KV data itself also wrapped after Fix 3,
     with batches 4–7 on top of batches 0–3.
   - So Fix 3's note that Fix 4 makes `large1:12` fit holds for its KV data only.
-  - Their earlier results modelled KV and temp data sharing cells. To run them, use a smaller
-    batch or sequence length, or a config with more KV capacity.
+  - Their earlier results came from an allocation where KV and temp data shared cells. The
+    simulator does not model per-cell occupancy, so that overlap did not change their numbers by
+    itself; the results are still invalid because the configs do not fit. To run them, use a
+    smaller batch or sequence length, or a config with more KV capacity.
 - **Everything else still runs.** KV row/column counts and task counts do not change. KV data
   now sits lower in each rank, and the temp tensors move.
   - Latency is unchanged in the default b1/b2 runs. With b1 only the temp tensor moves. With
@@ -432,10 +436,128 @@ Energy and the prefill/decode split are identical as well.
     per-batch size is not such a multiple will see their channel spread change.
   - Moving the temp tensors does not affect timing: `get_temp_tensor_locations` builds temp
     locations from the size of the dataflow-graph tensor, not from `temp_tensor_kv`'s address.
-  - Configs where the temp tensor previously sat on KV cells (29 AE configs) or where head
-    groups were partial no longer have overlapping data, so their per-location results can
-    change.
+  - Removing the temp/KV overlap (29 AE configs) changes no result by itself: nothing models
+    per-cell occupancy, and temp addresses do not affect timing (above). Results change only
+    where KV base addresses moved: configs with partial head groups, and b≥2 configs whose
+    per-batch size is not a multiple of `num_channels * csl_lines`.
 - **Fix 3 + Fix 4 together are safe for producing results.** Fix 3 alone let three AE configs
   (`DDR5-M1-R4-C8-8-A2` b8) wrap `Ro`; with per-rank counters those fit or raise, and no
   allocation can wrap silently any more. The walker issues (Fix 5, Fix 6) remain and still
   affect walked cells, as they did before Fix 3.
+
+## Fix 5 — KV walker stepped two (or four) columns per chip-partition
+
+**TL;DR:** `get_tensor_locations` walked every tensor in steps of `chip_partition_size`
+address units. For KV tensors one chip-partition is one allocator request, which is one `Co`
+step (`0x100` on DDR5). `chip_partition_size` is 512 on DDR5 and 1024 on GDDR6, so the walk
+touched every 2nd (GDDR6: 4th) column, covered 2× (4×) the tensor's reservation, and ran into
+the next tensor and, after Fix 4, into the `temp_tensor_kv` row. KV tensors now step exactly one
+request per chip-partition, with the step taken from the KV allocator. Every KV tensor's walked
+cells now equal its reserved cells. KV row accesses halve on DDR5 (quarter on GDDR6), but row
+counts do not enter latency; only the number and size of locations do (see Impact). Weights are
+untouched (Fix 6).
+
+### Why it happened
+The walker turns partition `i` of a tensor into an address and decodes it:
+
+```
+chip_partition_size = partition_size / num_chips         # bytes per chip per partition
+for i in range(num_partitions * num_chips):
+    step = i * chip_partition_size                        # chip_idx path; (i // num_chips) * ... for chip_idx == -1
+    addr = add_to_address_skipping_rank(base, step)       # KV (Fix 1); weights: base + step
+    (Ch, Ra, Ro, Co) = get_mapping(addr)
+```
+
+It adds a byte count to an address. In `RoChRaCoBgBaBt` AB mode the bits below `Co`
+(`Bg Ba Bt`, 8 bits on DDR5) are zero in every request, so one request is `0x100` address
+units while `chip_partition_size` is `0x200`. With 2× the step the walk visits columns
+`0, 2, 4, …`, crosses into the next channel and row twice as fast, and ends at twice the
+tensor's reserved range. On GDDR6 (`chip_partition_size` 1024, request `0x100`) it is 4×.
+DDR4 (`chip_partition_size` 128, request `0x80`) happened to match, so it was already correct.
+
+### The fix
+```
+step_kv = rr_alloc(1, batch=0) - rr_alloc(0, batch=0)    # one request; checked against the allocator
+addr_step = step_kv if KV else chip_partition_size        # weights unchanged until Fix 6
+for i in ...:
+    step = i * addr_step                                  # or (i // num_chips) * addr_step
+    addr = add_to_address_skipping_rank(base, step)       # unchanged: Ra stays pinned
+```
+- `kv_request_address_step(dram)` (new, `dram_utils.py`, cached per DRAM config) takes the
+  step from the KV round-robin allocator. It also checks, at the requests where `Co` carries into
+  `Ch` and `Ch` into `Ro`, that `add_to_address_skipping_rank(base, r * step)` equals
+  `rr_alloc(r)`. A layout where the address walk would not follow the allocator raises
+  instead of walking the wrong cells.
+- This keeps address arithmetic instead of walking in request space (`rr_alloc(base_request + i)`).
+  Request space would need the batch index and an inverse of the allocator in the walker, which
+  runs for every KV slice of every decode step. The check above gives the same guarantee.
+- A partition's `end_addr` is now `addr + addr_step` for KV (nothing decodes it).
+
+### Validation
+`alloc_check.py` + `temp_walk_check.py` on the 12-config matrix (`out_fix5/` vs `out_fix4/`) and
+the partial-group config (MISTRAL-7B `DDR5-M4-R4-C16-8-A2` b3 s1024):
+
+| Check | Fix 4 | Fix 5 |
+|---|---|---|
+| Walked cells outside the tensor's reservation, `DDR5-M4-R4-C8` b2 s1024 | 1,048,576 | 0 |
+| Reserved cells never walked, same | 1,048,576 | 0 |
+| Walked cells shared by >1 tensor, same | 1,044,480 | 0 |
+| Distinct walked cells, same (reserved: 2,097,152) | 1,052,672 | 2,097,152 |
+| `temp_tensor_kv` cells reached by the KV walk, b1 s16 / b2 s1024 / b1 s8192 / partial groups | 8 / 64 / 32 / 64 (of 128) | 0 / 0 / 0 / 0 |
+| GDDR6 b2 s1024: walked cells outside reservation / distinct walked cells | 786,432 / 265,216 | 0 / 1,048,576 |
+| DDR4 b2 s1024 (step already one request) | — | identical in every metric |
+
+- In all 12 configs and the partial-group run: walked cells outside the reservation, reserved
+  cells never walked, walked cells shared by >1 tensor, and temp cells walked are all 0, and the
+  distinct walked cells equal the reserved cells exactly.
+- Weight digest, KV column accesses and all allocator metrics are unchanged in all 12.
+- KV row accesses halve in every DDR5 config (e.g. b2 s1024 65,536 → 32,768; b1 s8192 262,144 →
+  131,072), quarter on GDDR6 (131,072 → 32,768), and are unchanged on DDR4. At b1 s16 they go
+  2,304 → 2,048.
+- Locations (one per `(channel, kv_rank, chip)` a tensor touches, and one task each) change
+  where the 2× span crossed more channels: `DDR5-M16-R2` b2 s1024 tensors span 8 channels
+  instead of 16 (65,536 → 32,768 per-location tasks), and at b1 s16 256 of 2,048 tensors no
+  longer spill into a second channel (2,304 → 2,048). Elsewhere a tensor already covered every
+  channel, so location and task counts stay the same (`HARMONI_phase2_diag/loc_stats.py`).
+
+Default run (`runwrap.py`, `-i 32 -o 16`, `DDR5-M4-R4-C8-8-A2`):
+
+| Run | KV tasks per KV rank (per-location) | Aggregation tasks (`wt_rank=None`) | Latency Fix 4 → Fix 5 | Prefill / decode |
+|---|---|---|---|---|
+| `-b 1` | 1648 (1248) → 1272 (496) | 1281 → 905 | 31,712.120 → 31,705.794 µs (−0.02%) | 10.295 → 10.359 ms / 21.417 → 21.347 ms |
+| `-b 2` | 1648 (1248) → 1272 (496), per rank | 2417 → 1665 | 43,383.915 → 43,379.510 µs (−0.01%) | 20.325 → 20.389 ms / 23.059 → 22.991 ms |
+
+Weight tasks are unchanged (4736 / 3104 at b1). Energy: 3344.18 → 3342.07 mJ (b1),
+4502.61 → 4498.38 mJ (b2).
+
+### Impact on results
+- **Row and column counts do not reach latency or energy.** `transformer_sim.get_node_metrics`
+  computes `mem_time = (rows − 1)·tRC + cols·tCCDs` and `memory_access_energy(rows, cols)` from
+  them, but neither is used: a node's `exec_time` is its compute time, and the energy comes
+  from the kernel models. So halving KV row accesses changes no number by itself.
+- **What does move results is the location structure.** `map_tasks_to_logic_units` creates
+  one subtask per location `(channel, kv_rank, chip)`, plus aggregation nodes, and splits the
+  work by location size. A tensor whose 2× walk crossed into an extra channel is now one
+  location, not two. That gives fewer, larger subtasks and fewer aggregation nodes:
+  - At seq 48 (default run, b1), 1248 → 496 per-location KV subtasks and 376 fewer aggregation
+    nodes. Decode gets faster (21.417 → 21.347 ms). Prefill gets slightly slower
+    (10.295 → 10.359 ms): a prefill slice is 16 requests on one chip, and with the 2× walk it
+    spans 32 columns, so 3 of the 8 head groups' slices crossed a channel boundary and ran as two
+    parallel half-size subtasks. With the 1× walk only 1 of 8 crosses, so that work now runs as
+    one subtask. Net −6.3 µs (b1) and −4.4 µs (b2).
+  - Where every KV tensor already spans all channels (seq ≥ 512 on `DDR5-M4`), locations do
+    not change, so latency does not either. `-i 1024 -o 8 -b 1` gives 380,020.237 µs with both
+    the Fix 4 and the Fix 5 step (prefill 368.863 ms, decode 11.158 ms, 2048 KV tasks both
+    times). Energy moves by 29,089.85 → 29,088.43 mJ because location sizes shift even though
+    their number does not: for decode slices of 1024–1031 tokens, 768 of 8,192 slices split their
+    last partial chunk differently (e.g. 2,048 + 2,048 bytes over two channels before, 4,096 in one
+    channel now), which changes the ceil-rounded subtask shapes the energy model sees. The "Fix 4"
+    side was run with the old step
+    patched in (`runwrap_oldstep.py`), which reproduces the Fix 4 default run exactly
+    (31,712.120 µs).
+  - `DDR5-M16-R2` b1 at seq 48 moves like `DDR5-M4`: 20,841.576 → 20,833.906 µs, with the same
+    task pattern (reviewer's run). At seq 1024 the 2× walk spread each tensor over 16 channels
+    instead of 8, so there its KV subtasks halve (65,536 → 32,768 at b2) and latency should move
+    more; that was not run end to end.
+- Results from before this fix modelled KV tensors spread over up to 2× (4× on GDDR6) the
+  channels/rows they occupy, overlapping their neighbours. DDR4 results do not change.

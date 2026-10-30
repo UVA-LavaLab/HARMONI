@@ -281,6 +281,12 @@ def calculate_interleaving_aware_offset_with_batch_round_robin(request_number, d
                 #remaining_request //= (max_value + 1)
                 remaining_request >>= bits
         
+        # Bits left over after the top field mean Ro would wrap onto earlier KV data. update_model_kv checks
+        # capacity before allocating; this is the backstop for any other caller
+        if remaining_request:
+            raise ValueError(f"KV request {request_number} (batch {batch_idx}) does not fit in a KV rank: "
+                             f"a KV rank holds {requests_before_wrap(dram, ['Ra'])} requests")
+        
         # Reconstruct address from components
         addr_offset = 0
         for i, component in enumerate(interleaving_components):
@@ -295,6 +301,22 @@ def calculate_interleaving_aware_offset_with_batch_round_robin(request_number, d
         # Use the original function for non-batch allocation
         return calculate_interleaving_aware_offset(request_number, dram, rank_type, chip_idx)
    
+
+def requests_before_wrap(dram, pinned_components):
+    """
+    Number of request numbers an interleaving-aware allocator can place before its top field (Ro) wraps.
+    Mirrors the request bits the allocators consume: every field except the pinned ones, and except
+    Ba/Bg/Bt in AB mode (zeroed). KV round-robin allocator: pinned ['Ra'], one KV rank.
+    Explicit channel/rank allocator: pinned ['Ch', 'Ra'], one (channel, rank).
+    """
+    num_values = {'Bt': dram.burst_length, 'Co': dram.csl_lines, 'Ro': dram.rows_per_bank, 'Ba': dram.num_banks_per_bankgroup,
+                  'Bg': dram.num_bankgroups_per_chip, 'Ra': dram.num_ranks_per_channel, 'Ch': dram.num_channels}
+    bits = 0
+    for component in [dram.addr_interleaving[i:i+2] for i in range(0, len(dram.addr_interleaving), 2)]:
+        if component in pinned_components or (dram.mode == "AB" and component in ['Ba', 'Bg', 'Bt']):
+            continue
+        bits += int(math.ceil(math.log(num_values[component], 2)))
+    return 2**bits
 
 def calculate_interleaving_aware_offset_with_explicit_channel_rank(request_number, dram, rank_type, target_channel, target_rank, chip_idx=-1):
     """

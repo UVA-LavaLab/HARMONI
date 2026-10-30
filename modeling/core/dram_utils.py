@@ -61,6 +61,8 @@ def get_accesses(requests, dram, wmeta):
     wmeta.col_accesses = requests
     wmeta.row_accesses = math.ceil(requests/dram.csl_lines)
 
+# Cached: the weight and KV walks call this (via add_to_address_skipping_rank) once per partition, ~26 M times for LLAMA2-7B
+@lru_cache(maxsize=None)
 def get_rank_offset(dram):
     """
     Returns rank_offset based on the dram organizations bits value and the interleaving scheme
@@ -87,13 +89,15 @@ def get_rank_offset(dram):
     logger.debug(f"Rank offset calculation shift bits {shift_bits}, rank offset {1 << shift_bits}")
     return 1 << shift_bits
 
-def add_to_address_skipping_rank(addr_offset, delta, dram):
+def add_to_address_skipping_rank(addr_offset, delta, dram, carried_rank_bits=0):
     """
     Returns addr_offset + delta with the Ra field held fixed: carries out of the bits below Ra
     go to the bits above Ra instead. Used for KV tensors whose rank is pinned by batch round-robin.
+    carried_rank_bits low bits of Ra stay in the carry chain (weights: Ra counts through the weight
+    ranks 0..num_wt-1, and only the bits above them, which select KV ranks, are held fixed).
     """
-    rank_shift = get_rank_offset(dram).bit_length() - 1
-    rank_bits = int(math.ceil(math.log(dram.num_ranks_per_channel, 2)))
+    rank_shift = get_rank_offset(dram).bit_length() - 1 + carried_rank_bits
+    rank_bits = int(math.ceil(math.log(dram.num_ranks_per_channel, 2))) - carried_rank_bits
     low_mask = (1 << rank_shift) - 1
     rank = (addr_offset >> rank_shift) & ((1 << rank_bits) - 1)
     # Remove Ra bits, add, then put the same Ra bits back
@@ -143,6 +147,10 @@ def calculate_interleaving_aware_offset_cached(request_number, dram, rank_type, 
             components[component] = remaining_request & max_value
             remaining_request >>= bits
     
+    # Bits left over after the top field mean Ro would wrap onto earlier data. update_model_weight checks
+    # capacity before allocating; this is the backstop for any other caller
+    if remaining_request:
+        raise ValueError(f"{rank_type} request {request_number} does not fit: Ro would wrap onto earlier data")
     
     # Reconstruct address from components
     addr_offset = 0
@@ -317,6 +325,31 @@ def requests_before_wrap(dram, pinned_components):
             continue
         bits += int(math.ceil(math.log(num_values[component], 2)))
     return 2**bits
+
+def weight_carried_rank_bits(dram):
+    """Low Ra bits the weight allocator counts through (Ra = request % num_wt_ranks); the rest stay 0 for weights."""
+    return int(math.ceil(math.log(dram.num_wt_ranks_per_channel, 2)))
+
+@lru_cache(maxsize=None)
+def weight_request_address_step(dram):
+    """
+    Address delta between consecutive weight requests r and r+1 of the weight allocator (one Co step in AB mode).
+    get_tensor_locations walks weight tensors one request per chip-partition with this step, adding it with
+    add_to_address_skipping_rank(..., weight_carried_rank_bits) so carries go Co -> weight Ra -> Ch -> Ro like the
+    allocator. Checked against the allocator so the walk covers exactly the requests it reserved.
+    """
+    alloc = lambda r: calculate_interleaving_aware_offset(r, dram, "weight", -1)
+    step = alloc(1) - alloc(0)
+    kept = weight_carried_rank_bits(dram)
+    # Requests that cross into the next field (Co -> Ra -> Ch -> Ro); the address walk must carry exactly like the allocator
+    per_co = requests_before_wrap(dram, ['Ra', 'Ch', 'Ro'])
+    per_ra = per_co * dram.num_wt_ranks_per_channel
+    per_row = requests_before_wrap(dram, ['Ra', 'Ro']) * dram.num_wt_ranks_per_channel
+    for base in [0, per_co + 1, per_ra - 1]:
+        for r in [1, per_co - 1, per_co, per_ra - 1, per_ra, per_row - 1, per_row, per_row + per_ra + per_co + 1]:
+            if add_to_address_skipping_rank(alloc(base), r * step, dram, kept) != alloc(base + r):
+                raise ValueError(f"Weight address walk does not follow the weight allocator for {dram.addr_interleaving} in {dram.mode} mode (request {base} + {r})")
+    return step
 
 @lru_cache(maxsize=None)
 def kv_request_address_step(dram):

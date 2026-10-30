@@ -43,7 +43,7 @@ for i in partitions:
     if tensor is KV:
         addr = add_to_address_skipping_rank(base, i * chip_partition_size)
     else:
-        addr = base + i * chip_partition_size    # weights unchanged
+        addr = base + i * chip_partition_size    # weights unchanged (same carry into Ra, hidden by % num_wt; see Fix 6)
 
 add_to_address_skipping_rank(addr, delta):
     take the Ra bits out, add delta to what is left, put the same Ra bits back
@@ -561,3 +561,151 @@ Weight tasks are unchanged (4736 / 3104 at b1). Energy: 3344.18 → 3342.07 mJ (
     more; that was not run end to end.
 - Results from before this fix modelled KV tensors spread over up to 2× (4× on GDDR6) the
   channels/rows they occupy, overlapping their neighbours. DDR4 results do not change.
+
+## Fix 6 — Weight walker ran into KV ranks; temp_tensor_wt wrapped onto weights
+
+**TL;DR:** `get_tensor_locations` walked weight tensors with a raw address add of
+`chip_partition_size`. The weight allocator counts `Co`, then the weight ranks, then `Ch`, then
+`Ro`, but the raw add carried from `Co` into every `Ra` bit, so half of all walked weight
+addresses decoded to a KV rank and were folded back with `rank % num_wt_ranks`. The walk now
+steps one weight request per chip-partition and skips only the `Ra` bits that select KV ranks,
+so every weight tensor's walked cells equal its reserved cells. `temp_tensor_wt` was given the
+weight counter, in the wrong units for its allocator, and wrapped `Ro` in 111 of the 120 AE
+configs (onto weight rows in 26); it now sits in the first row above the weights. Partial
+Wq/Wk/Wv head groups now advance the counter. Anything that does not fit raises; no AE config
+does. On DDR5 the per-location sizes the simulator uses are unchanged for all but two tiny
+tensors, so DDR5 results are unchanged in every run below; GDDR6 and DDR4 results change (see Impact).
+
+### Why it happened
+```
+step = i * chip_partition_size            # 2 requests on DDR5, 4 on GDDR6, 1 on DDR4
+addr = base + step                        # raw add: Co carries into Ra, all of its bits
+rank = Ra % num_wt_ranks                  # Ra 2/3 (KV ranks) folded onto 0/1
+```
+1. **Carry into KV ranks.** The weight allocator (`calculate_interleaving_aware_offset_cached`,
+   `"weight"`) fills `Co`, then `Ra = r % num_wt` (consuming request bits), then `Ch`, then `Ro`.
+   Weight `Ra` values are `0..num_wt-1`; the bits above them select KV ranks. A raw add carries
+   from `Co` into the full `Ra` field, so on `DDR5-M4-R4-C8` 13,160,456 of the walked addresses
+   had `Ra` 2 or 3. `rank % num_wt_ranks` hid this.
+2. **Wrong step.** As in Fix 5, one weight request is one `Co` step (`0x100` on DDR5, `0x80` on
+   DDR4), not `chip_partition_size`.
+3. **temp_tensor_wt.** The explicit channel/rank allocator pins `Ch` and `Ra` and takes only `Co`
+   and `Ro` from its request number. It was given the weight counter, which also counts `Ra` and
+   `Ch`, so it wrapped `Ro` (Fix 4's `temp_tensor_kv` bug, on the weight side).
+4. **Partial head groups.** Without `--fused_qkv`, Wq/Wk/Wv are allocated per head in groups of
+   `num_chips`; a partial last group (`kv_heads % num_chips != 0`, e.g. MISTRAL-7B on 16 chips)
+   never advanced the counter, so the next tensor started on top of it.
+
+### The fix
+```
+step_wt = wt_alloc(1) - wt_alloc(0)                   # one request; checked against the allocator
+kept    = log2(num_wt_ranks)                          # Ra bits the weight allocator counts through
+for i in ...:
+    step = i * step_wt                                # or (i // num_chips) * step_wt
+    addr = add_to_address_skipping_rank(base, step, carried_rank_bits=kept)
+    if Ra >= num_wt: raise                            # was: rank % num_wt_ranks
+check(counter + requests <= num_wt * 2^(Co+Ch+Ro)) before every weight allocation   # else ValueError
+if (h + 1) % chips == 0 or h == heads - 1: counter += group                        # partial group too
+row  = Ro(wt_alloc(counter - 1)) + 1
+check(row * 2^Co + temp_requests <= 2^(Co+Ro));  temp = explicit_alloc(row * 2^Co, ch, r)
+```
+- `add_to_address_skipping_rank` gains `carried_rank_bits`: that many low `Ra` bits stay in the
+  carry chain (`Co -> weight Ra -> Ch -> Ro`), and only the KV-selecting bits are held fixed.
+  KV calls pass 0, which is the old behaviour.
+- `weight_request_address_step(dram)` (new, cached) takes the step from the weight allocator and
+  checks `add_to_address_skipping_rank(wt_alloc(b), r * step, kept) == wt_alloc(b + r)` at every
+  field boundary (`Co -> Ra -> Ch -> Ro`) from three bases. It passes on all 20 DRAM configs in
+  `config/dram_config.py`.
+- The weight allocator also raises when bits are left over after `Ro` (backstop, like Fix 4's).
+- `rank % num_wt_ranks` is replaced by a `ValueError`: with the new walk, `Ra >= num_wt` cannot
+  occur (0 walked addresses on a KV rank in every run below).
+- The `WEIGHT`-only `get_tensor_locations.cache` is unchanged (same key; only the walk differs).
+
+### Validation
+**Capacity** (`scan_weight_capacity.py`, all 120 configs in `params/*.txt`, before → after):
+
+| Check | Fix 5 | Fix 6 |
+|---|---|---|
+| Configs whose weights exceed the weight capacity | 0 (max fill 0.78) | 0 |
+| `temp_tensor_wt` wraps `Ro` | 111 | 0 (placed above the weights) |
+| `temp_tensor_wt` lands on weight rows | 26 | 0 |
+| Configs that raise (`--fused_qkv` and without) | — | 0 (max temp fill 0.82, `large1:16`) |
+
+**Walk vs allocation** (`wt_alloc_check.py` → `out_fix6/w_*.log`: 9 DRAM/model pairs covering the
+12-config matrix plus MISTRAL-7B `DDR5-M4-R4-C16`, each with and without `--fused_qkv`;
+"Fix 5" uses HEAD's walker and allocator). Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B:
+
+| Check | Fix 5 | Fix 6 |
+|---|---|---|
+| Walked addresses on a KV rank (folded by `% num_wt`) | 13,160,456 | 0 |
+| Walked cells outside the tensor's reservation / reserved cells never walked | 13,160,968 / 13,160,968 | 0 / 0 |
+| Walked cells shared by >1 tensor | 504 | 0 |
+| Distinct walked cells (reserved: 26,321,936) | 26,321,432 | 26,321,936 |
+| `temp_tensor_wt` cells on weight reservations / off target | 0 / 0 | 0 / 0 |
+| Weight locations (`--fused_qkv`) | 10,904 | 10,888 |
+
+- All 18 runs: 0 walked addresses on a KV rank, 0 walked cells outside the reservation, 0
+  reserved cells never walked, 0 cells shared, 0 off-rank, and walked cells = reserved cells.
+- GDDR6 (step 4×) was the worst: 6,708,608 distinct walked cells for 13,160,968 reserved, with
+  5.9 M shared; now 13,160,968 and 0.
+- Partial groups (MISTRAL-7B `DDR5-M4-R4-C16`, no `--fused_qkv`): reserved cells shared by >1
+  tensor 1,048,576 → 0, and the weights now end at request 1,833,537 instead of 1,702,465.
+- KV is unchanged: the 12-config `alloc_check` + `temp_walk_check` matrix (`out_fix6/` vs
+  `out_fix5/`) is identical in every KV, allocator and temp metric; only the weight digest changes.
+
+**Locations as task mapping sees them** (`wt_locs_dump.py`, per tensor `(location, size)`):
+- DDR5 `M4-R4-C8`, `M8-R4-C8`, `M4-R4-C16` (LLAMA2-7B, `--fused_qkv`): identical for 225 or all
+  227 tensors. Only two `rms_norm1` tensors (2 requests each) change, from 16 locations of 512 B
+  to 8 of 1 KB, when they start at the last column pair of a row.
+- GDDR6: 98 of 227 tensors change (all Wup/Wgate/Wdown, embedding and unembedding).
+- All 16 (model, DRAM) pairs in the AE `params/*.txt` (all DDR5, `--fused_qkv`, reviewer's
+  `f6_locdiff.py`): only `rms_norm1` tensors change (2 per LLAMA2-7B pair, 4 on C4, 0 on R2 and
+  C16; 10 for LLAMA3-70B). The DDR5 runs above include that change and are identical.
+
+Runs (`runwrap.py`, `--fused_qkv`; "Fix 5" for GDDR6/DDR4 uses HEAD's walker via `runwrap_refwalk.py`):
+
+| Run | Weight tasks per wt_rank | Latency Fix 5 → Fix 6 | Energy |
+|---|---|---|---|
+| `DDR5-M4-R4-C8` `-i 32 -o 16 -b 1` | 4736 / 3104, unchanged | 31,705.794 → 31,705.794 µs | 3342.07 mJ, unchanged |
+| same, `-b 2` | 5248 / 3104, unchanged | 43,379.510 → 43,379.510 µs | 4498.38 mJ, unchanged |
+| same, `-i 1024 -o 8 -b 1` | 2384 / 1568, unchanged | 380,020.237 → 380,020.237 µs | 29,088.43 mJ, unchanged |
+| `GDDR6-M8-R4-C8` `-i 32 -o 16 -b 1` | 7840 / 6208, unchanged | 10,176.768 → 10,966.656 µs (+7.8%) | 1472.33 → 1573.00 mJ |
+| `DDR4-M8-R4-C8` `-i 32 -o 16 -b 1` | 7840 / 6208, unchanged | 56,136.890 → 52,226.522 µs (−7.0%) | 5899.15 → 5668.23 mJ |
+
+KV tasks are unchanged in every run. The refwalk runner reproduces Fix 5's `DDR5-M4-R4-C8` b1 run
+exactly (31,705.794 µs).
+
+### Impact on results
+- **DDR5 (every AE config): no change expected.** On DDR5 the raw add stepped 2 requests but also
+  ran through 2× as many `Ra` values (the KV ones, folded back), so each `(channel, wt_rank,
+  chip)` still received the same share of every tensor. The per-location sizes, which are what
+  task mapping uses, are identical except for the two tiny `rms_norm1` tensors, and the default,
+  b2 and `-i 1024` runs are identical to Fix 5. The cells behind those locations were wrong (half
+  on KV ranks, some shared), but nothing models per-cell occupancy.
+- **GDDR6 changes.** The 4× step was only half compensated, so the old walk spread each tensor
+  evenly over all channels (by overlapping itself). The true layout is uneven when a tensor is not
+  a whole number of sweeps (`Co × num_wt × Ch` requests): LLAMA2-7B's FFN weights are 11,008
+  requests = 21.5 sweeps of 512, so channels 0–3 hold 720,896 B per location and channels 4–7
+  hold 688,128 B, instead of 704,512 B everywhere. Task mapping gives each location
+  `ceil(N · size / tensor_size)` columns, so Wdown's (N = 4096) subtasks get 33 columns instead
+  of 32, and `GEMV_latency_energy` spreads those over 32 banks with `ceil(N / total_banks)`: two
+  columns per bank instead of one. The decode `down_gemm` GEMV doubles (787.2 → 1,571.5 µs on the
+  critical path): decode accounts for +784 of the +790 µs, prefill for +5 µs.
+- **DDR4 changes the other way.** Its step was already one request, but the raw add still ran
+  through all 4 `Ra` values, so the old walk covered only half a channel per sweep. The FFN
+  weights (88,064 requests = 43 whole sweeps of 2,048 in the true layout) were split unevenly
+  (720,896 / 688,128 B per location), and are now even (704,512 B). Wdown's subtasks drop from
+  33 to 32 columns, the decode GEMVs get faster (decode 41.224 → 37.452 ms), and latency falls 7.0%.
+- **The ±7-8% is a modelling-granularity effect, not GDDR6/DDR4 physics.** A 2.3% per-location
+  data imbalance becomes a 2× GEMV through `ceil(N / total_banks)`, and `ceil(N · ratio)` per
+  location makes the columns add up to more than N (64 × 33 + 64 × 32 = 4160 vs 4096). Do not read
+  +7.8% as a real GDDR6 slowdown. Possible follow-up (a modelling decision, not part of this fix):
+  split N across locations exactly (largest remainder), and/or have `GEMV_latency_energy` use bytes
+  per bank instead of `ceil` on columns. Aligning or padding weight tensors to whole sweeps would
+  only hide the imbalance and change the modelled footprint.
+- Whether a config moves therefore depends on whether its tensors are whole sweeps in the true
+  layout and on the `ceil` steps in task mapping and the GEMV model. DDR5 is unaffected because
+  its old walk happened to give the same shares.
+- `temp_tensor_wt` placement does not affect timing (`get_temp_tensor_locations` uses the DFG
+  tensor's size, as for `temp_tensor_kv`).
+- Partial head groups only exist without `--fused_qkv`; every AE script passes `--fused_qkv`.

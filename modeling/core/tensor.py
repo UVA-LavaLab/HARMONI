@@ -1,6 +1,6 @@
 from misc.type import *
 from utils.logging_util import logger
-from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, add_to_address_skipping_rank, kv_request_address_step
+from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, add_to_address_skipping_rank, kv_request_address_step, weight_request_address_step, weight_carried_rank_bits
 from collections import defaultdict
 import math
 
@@ -159,11 +159,17 @@ class HarmoniTensor:
         # Calculate number of partitions needed for this tensor
         num_partitions = math.ceil(tensor_size / partition_size)
         chip_partition_size = partition_size // num_chips    
-        # Address distance between consecutive chip-partitions. One KV chip-partition is one allocator request
-        # (one Co step, 0x100 on DDR5), not chip_partition_size address units (512 on DDR5, 1024 on GDDR6), which
-        # skipped columns and ran past the tensor's reservation into the next one. Weights keep chip_partition_size
-        # because their allocator orders fields differently (Co -> Ra -> Ch -> Ro); Fix 6 revisits them
-        addr_step = kv_request_address_step(dram) if tensor.tag == HarmoniTensorType.KV else chip_partition_size
+        # Address distance between consecutive chip-partitions. One chip-partition is one allocator request (one Co
+        # step, 0x100 on DDR5), not chip_partition_size address units (512 on DDR5, 1024 on GDDR6), which skipped
+        # columns and ran past the tensor's reservation into the next one. KV and weight allocators order their
+        # fields differently (KV: Co -> Ch -> Ro, Ra pinned; weight: Co -> Ra (weight ranks) -> Ch -> Ro), so each
+        # tag takes its step, and the carry rule below, from its own allocator
+        if tensor.tag == HarmoniTensorType.KV:
+            addr_step = kv_request_address_step(dram)
+        elif tensor.tag == HarmoniTensorType.WEIGHT:
+            addr_step = weight_request_address_step(dram)
+        else:
+            addr_step = chip_partition_size
              
         for i in range(num_partitions*num_chips):
             
@@ -177,6 +183,9 @@ class HarmoniTensor:
             if tensor.tag == HarmoniTensorType.KV:
                 # KV rank is pinned by batch round-robin: carries must skip the Ra field, not spill into it
                 addr = add_to_address_skipping_rank(int(tensor.addr_offset), step, dram)
+            elif tensor.tag == HarmoniTensorType.WEIGHT:
+                # Weights count through the weight ranks only: carries skip the Ra bits that select KV ranks
+                addr = add_to_address_skipping_rank(int(tensor.addr_offset), step, dram, weight_carried_rank_bits(dram))
             else:
                 addr = int(tensor.addr_offset) + step
 
@@ -195,7 +204,10 @@ class HarmoniTensor:
             
             # Respect the tensor's tag when determining rank type
             if tensor.tag == HarmoniTensorType.WEIGHT:
-                rank = rank % dram.num_wt_ranks_per_channel
+                # The walk follows the weight allocator, so Ra is always a weight rank; a KV rank here would be
+                # folded onto a weight rank's logic unit, so fail loudly instead
+                if rank >= dram.num_wt_ranks_per_channel:
+                    raise ValueError(f"Weight tensor {tensor.name} decoded to KV rank Ra={rank} at addr 0x{addr:x}")
             elif tensor.tag == HarmoniTensorType.KV:
                 # Ra is pinned to the batch's KV rank; never write to partition_mapping (shared lru_cache dict).
                 # A weight rank here would give a negative kv_rank that silently matches no logic unit, so fail loudly.

@@ -11,6 +11,18 @@ Address layout used in the examples (`DDR5-M4-R4-C8-8-A2`, `RoChRaCoBgBaBt`, AB 
  ranks 0-1 = weight ranks, ranks 2-3 = KV ranks (kv_rank 0, 1)
 ```
 
+**How the numbers below were checked.** The validation numbers come from diagnostic scripts
+kept outside this repo. They do three kinds of check:
+- **Walk vs allocation.** Instrument the allocators and `get_tensor_locations`, decode every
+  request and every walked address to a cell `(Ch, Ra, chip, Ro, Co)`, and compare per tensor.
+- **Capacity scan.** Run the allocation for every config in `params/*.txt`.
+- **Full runs.** Run `run.py --simulate` end to end.
+
+"The 12-config matrix" is this fixed set of (DRAM, model, batch, seq):
+`DDR5-M4-R4-C8` LLAMA2-7B at b1 s16, b2/b3/b4 s1024 and b1 s8192; `DDR5-M4-R8-C8` b4 s1024;
+`DDR5-M16-R2-C8`, `DDR4-M8-R4-C8`, `GDDR6-M8-R4-C8` and `DDR5-M4-R4-C16` at b2 s1024;
+MISTRAL-7B `DDR5-M4-R4-C8` b2 s1024; PHI3-7B `DDR5-M4-R4-C8` b3 s512 (all `-8-A2`).
+
 ---
 
 ## Fix 1 — KV tensors spilled onto every rank (batch round-robin ignored)
@@ -130,7 +142,7 @@ object, and a comment there now marks it as read-only.
 Code: `modeling/core/tensor.py:get_tensor_locations`, `modeling/core/dram_utils.py:get_mapping_cached`.
 
 ### Validation
-Probe at Fix 1, with the branch still present (`HARMONI_phase2_diag/branch_probe.py`).
+Probe at Fix 1, with the branch still present and instrumented.
 "Default" is `run.py --model_name LLAMA2-7B --dtype BF16 --dram DDR5-M4-R4-C8-8-A2
 -i 32 -o 16 -b 1 --simulate --optimization layer static_mapping --fused_attn --fused_qkv
 --no_cache`:
@@ -141,12 +153,12 @@ Probe at Fix 1, with the branch still present (`HARMONI_phase2_diag/branch_probe
 | same, no `--fused_attn` | 1,024 | 0 / 24,064 | 0 |
 | same, no `--fused_qkv` | 1,024 | 0 / 24,064 | 0 |
 | same, batch 2 | 2,048 | 0 / 48,128 | 0 |
-| kv_check, all layers, R4, b4, seq 1024 | 8,192 | 0 / 4,194,304 | 0 |
-| kv_check, all layers, R2 (1 KV rank), b3, seq 1024 | 6,144 | 0 / 3,145,728 | 0 |
+| Walk check, all layers, R4, b4, seq 1024 | 8,192 | 0 / 4,194,304 | 0 |
+| Walk check, all layers, R2 (1 KV rank), b3, seq 1024 | 6,144 | 0 / 3,145,728 | 0 |
 
 | Check | Fix 1 | Fix 2 |
 |---|---|---|
-| kv_check JSON, 12 configs | baseline | identical |
+| KV walk check, 12-config matrix | baseline | identical |
 | Default run: tasks on kv_rank 0 / 1 | 1648 / 0 | 1648 / 0 |
 | Critical-path latency (same run) | 31,832.268 µs | 31,832.268 µs |
 
@@ -198,10 +210,10 @@ change the weight allocator (whose `Ra` really is taken from the request), `temp
 Code: `modeling/core/dram_utils.py:calculate_interleaving_aware_offset_with_batch_round_robin`.
 
 ### Validation
-`HARMONI_phase2_diag/alloc_check.py` logs every KV allocator call. Each (K or V) head group
+The allocation check logs every KV allocator call. Each (K or V) head group
 owns the requests from its call up to the next call, and each head owns them on its own
-chip. Every request is decoded to a cell `(Ch, Ra, chip, Ro, Co)`. The tool also runs
-`kv_check.py` (walked cells). Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B, batch 2, seq 1024:
+chip. Every request is decoded to a cell `(Ch, Ra, chip, Ro, Co)`, and the walked cells are
+checked too. Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B, batch 2, seq 1024:
 
 | Check | Before | After |
 |---|---|---|
@@ -246,7 +258,7 @@ the walker reports were never what the allocator reserved, and Fix 5 addresses t
 pinned `Ra` no longer consumes request bits, KV addresses now climb through `Ro` `num_kv`×
 faster. With the counter still shared by all KV ranks, the number of requests that fit before
 `Ro` wraps falls from `num_kv · 2^(Co+Ch+Ro)` to `2^(Co+Ch+Ro)`. A scan of all 120 configs in
-`params/*.txt` (`HARMONI_phase2_diag/rev/ro_overflow.py`) finds 0 that overflow before this fix
+`params/*.txt` finds 0 that overflow before this fix
 and 3 after, all LLAMA2-7B on `DDR5-M1-R4-C8-8-A2` with batch 8:
 
 | Config | KV requests / capacity | Effect |
@@ -346,8 +358,7 @@ for ch, r:
   because `temp_tensor_wt` also uses it.
 
 ### Validation
-**Capacity scan** (`HARMONI_phase2_diag/scan_capacity.py` → `out_fix4_scan.txt`, all 120 configs in
-`params/*.txt`): no config overflows with KV data. Two raise on `temp_tensor_kv`:
+**Capacity scan** (all 120 configs in `params/*.txt`): no config overflows with KV data. Two raise on `temp_tensor_kv`:
 
 | Config | KV fill per KV rank | Error |
 |---|---|---|
@@ -358,10 +369,10 @@ The next fullest configs reach 0.53 of a rank (`large.txt:27`, `small.txt:26`), 
 The KV-data check was exercised separately: batch 9 on `DDR5-M4-R2-C4-8-A2` and seq 4097 at
 batch 8 on `DDR5-M1-R4-C8-8-A2` both raise on a K/V group, with the message shown above.
 
-**Overlap check** (`HARMONI_phase2_diag/overlap4.py --old` → `out_fix4_overlap.txt`). It covers
+**Overlap check.** It covers
 the 120 AE configs plus 4 extra configs with partial groups or rounding. Each tensor's true
 extent is `ceil(size / chip_partition)` requests from its base, taken modulo the rank capacity.
-"Before" is HEAD (Fix 3):
+"Before" is Fix 3:
 
 | Check | Before | After |
 |---|---|---|
@@ -373,7 +384,7 @@ extent is `ceil(size / chip_partition)` requests from its base, taken modulo the
 | LLAMA2-7B `DDR5-M4-R4-C16-8-A2` 32/16 b2 (`requests_local` rounds up) | 8,192 | 0 |
 | Configs that raise | 0 | 2 |
 
-**12-config matrix** (`alloc_check.py`, `out_fix4/` vs `out_fix3/post/`). `alloc_check` takes a
+**12-config matrix** (allocation check, Fix 4 vs Fix 3). The check takes a
 group's range up to the next call on the same KV rank, skips the RR calls made for temp
 placement, and now also checks that every temp request decodes to its own channel and KV rank.
 
@@ -395,15 +406,15 @@ placement, and now also checks that every temp request decodes to its own channe
   a no-regression check here; the overlap scan above covers the 29 AE configs.
 - Walked cells change only when a rank holds several batches: those batches are now adjacent,
   so the walker's overrun into the next tensor (Fix 5) reaches different cells.
-- Partial groups: MISTRAL-7B `DDR5-M4-R4-C16-8-A2` b3 s1024 (`out_fix4/extra_*.log`, 8 KV heads on
+- Partial groups: MISTRAL-7B `DDR5-M4-R4-C16-8-A2` b3 s1024 (8 KV heads on
   16 chips) gives 192 groups, 0 reserved cells shared, 0 off-rank, 0 temp/KV overlap, and every
   tensor gets exactly the requests it needs.
 - Until Fix 5, the walker (2× stride) still runs past the last KV tensor's reservation on a
   rank and reaches the temp row: 8 / 64 / 32 of 128 temp cells at b1 s16 / b2 s1024 / b1 s8192
-  (`temp_walk_check.py`, `out_fix4/tempwalk_*.txt`). The allocation itself is disjoint; Fix 5
+  The allocation itself is disjoint; Fix 5
   makes the walk equal the reservation.
 
-Default run (`runwrap.py`, `-i 32 -o 16`, `DDR5-M4-R4-C8-8-A2`):
+Default run (`-i 32 -o 16`, `DDR5-M4-R4-C8-8-A2`):
 
 | Run | Tasks per KV rank | Latency Fix 3 | Latency Fix 4 |
 |---|---|---|---|
@@ -494,7 +505,7 @@ for i in ...:
 - A partition's `end_addr` is now `addr + addr_step` for KV (nothing decodes it).
 
 ### Validation
-`alloc_check.py` + `temp_walk_check.py` on the 12-config matrix (`out_fix5/` vs `out_fix4/`) and
+Allocation and walk checks (KV and temp tensors) on the 12-config matrix, Fix 5 vs Fix 4, and
 the partial-group config (MISTRAL-7B `DDR5-M4-R4-C16-8-A2` b3 s1024):
 
 | Check | Fix 4 | Fix 5 |
@@ -518,9 +529,9 @@ the partial-group config (MISTRAL-7B `DDR5-M4-R4-C16-8-A2` b3 s1024):
   where the 2× span crossed more channels: `DDR5-M16-R2` b2 s1024 tensors span 8 channels
   instead of 16 (65,536 → 32,768 per-location tasks), and at b1 s16 256 of 2,048 tensors no
   longer spill into a second channel (2,304 → 2,048). Elsewhere a tensor already covered every
-  channel, so location and task counts stay the same (`HARMONI_phase2_diag/loc_stats.py`).
+  channel, so location and task counts stay the same.
 
-Default run (`runwrap.py`, `-i 32 -o 16`, `DDR5-M4-R4-C8-8-A2`):
+Default run (`-i 32 -o 16`, `DDR5-M4-R4-C8-8-A2`):
 
 | Run | KV tasks per KV rank (per-location) | Aggregation tasks (`wt_rank=None`) | Latency Fix 4 → Fix 5 | Prefill / decode |
 |---|---|---|---|---|
@@ -553,10 +564,10 @@ Weight tasks are unchanged (4736 / 3104 at b1). Energy: 3344.18 → 3342.07 mJ (
     last partial chunk differently (e.g. 2,048 + 2,048 bytes over two channels before, 4,096 in one
     channel now), which changes the ceil-rounded subtask shapes the energy model sees. The "Fix 4"
     side was run with the old step
-    patched in (`runwrap_oldstep.py`), which reproduces the Fix 4 default run exactly
+    patched in, which reproduces the Fix 4 default run exactly
     (31,712.120 µs).
   - `DDR5-M16-R2` b1 at seq 48 moves like `DDR5-M4`: 20,841.576 → 20,833.906 µs, with the same
-    task pattern (reviewer's run). At seq 1024 the 2× walk spread each tensor over 16 channels
+    task pattern. At seq 1024 the 2× walk spread each tensor over 16 channels
     instead of 8, so there its KV subtasks halve (65,536 → 32,768 at b2) and latency should move
     more; that was not run end to end.
 - Results from before this fix modelled KV tensors spread over up to 2× (4× on GDDR6) the
@@ -622,7 +633,7 @@ check(row * 2^Co + temp_requests <= 2^(Co+Ro));  temp = explicit_alloc(row * 2^C
 - The `WEIGHT`-only `get_tensor_locations.cache` is unchanged (same key; only the walk differs).
 
 ### Validation
-**Capacity** (`scan_weight_capacity.py`, all 120 configs in `params/*.txt`, before → after):
+**Capacity** (all 120 configs in `params/*.txt`, before → after):
 
 | Check | Fix 5 | Fix 6 |
 |---|---|---|
@@ -631,9 +642,9 @@ check(row * 2^Co + temp_requests <= 2^(Co+Ro));  temp = explicit_alloc(row * 2^C
 | `temp_tensor_wt` lands on weight rows | 26 | 0 |
 | Configs that raise (`--fused_qkv` and without) | — | 0 (max temp fill 0.82, `large1:16`) |
 
-**Walk vs allocation** (`wt_alloc_check.py` → `out_fix6/w_*.log`: 9 DRAM/model pairs covering the
+**Walk vs allocation** (weight check, 9 DRAM/model pairs covering the
 12-config matrix plus MISTRAL-7B `DDR5-M4-R4-C16`, each with and without `--fused_qkv`;
-"Fix 5" uses HEAD's walker and allocator). Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B:
+"Fix 5" uses the Fix 5 walker and allocator). Example `DDR5-M4-R4-C8-8-A2`, LLAMA2-7B:
 
 | Check | Fix 5 | Fix 6 |
 |---|---|---|
@@ -650,19 +661,17 @@ check(row * 2^Co + temp_requests <= 2^(Co+Ro));  temp = explicit_alloc(row * 2^C
   5.9 M shared; now 13,160,968 and 0.
 - Partial groups (MISTRAL-7B `DDR5-M4-R4-C16`, no `--fused_qkv`): reserved cells shared by >1
   tensor 1,048,576 → 0, and the weights now end at request 1,833,537 instead of 1,702,465.
-- KV is unchanged: the 12-config `alloc_check` + `temp_walk_check` matrix (`out_fix6/` vs
-  `out_fix5/`) is identical in every KV, allocator and temp metric; only the weight digest changes.
+- KV is unchanged: the 12-config KV and temp checks (Fix 6 vs Fix 5) are identical in every KV, allocator and temp metric; only the weight digest changes.
 
-**Locations as task mapping sees them** (`wt_locs_dump.py`, per tensor `(location, size)`):
+**Locations as task mapping sees them** (per tensor `(location, size)`):
 - DDR5 `M4-R4-C8`, `M8-R4-C8`, `M4-R4-C16` (LLAMA2-7B, `--fused_qkv`): identical for 225 or all
   227 tensors. Only two `rms_norm1` tensors (2 requests each) change, from 16 locations of 512 B
   to 8 of 1 KB, when they start at the last column pair of a row.
 - GDDR6: 98 of 227 tensors change (all Wup/Wgate/Wdown, embedding and unembedding).
-- All 16 (model, DRAM) pairs in the AE `params/*.txt` (all DDR5, `--fused_qkv`, reviewer's
-  `f6_locdiff.py`): only `rms_norm1` tensors change (2 per LLAMA2-7B pair, 4 on C4, 0 on R2 and
+- All 16 (model, DRAM) pairs in the AE `params/*.txt` (all DDR5, `--fused_qkv`): only `rms_norm1` tensors change (2 per LLAMA2-7B pair, 4 on C4, 0 on R2 and
   C16; 10 for LLAMA3-70B). The DDR5 runs above include that change and are identical.
 
-Runs (`runwrap.py`, `--fused_qkv`; "Fix 5" for GDDR6/DDR4 uses HEAD's walker via `runwrap_refwalk.py`):
+Runs (`--fused_qkv`; "Fix 5" for GDDR6/DDR4 is the Fix 6 code with the Fix 5 weight walker patched in):
 
 | Run | Weight tasks per wt_rank | Latency Fix 5 → Fix 6 | Energy |
 |---|---|---|---|
@@ -672,7 +681,7 @@ Runs (`runwrap.py`, `--fused_qkv`; "Fix 5" for GDDR6/DDR4 uses HEAD's walker via
 | `GDDR6-M8-R4-C8` `-i 32 -o 16 -b 1` | 7840 / 6208, unchanged | 10,176.768 → 10,966.656 µs (+7.8%) | 1472.33 → 1573.00 mJ |
 | `DDR4-M8-R4-C8` `-i 32 -o 16 -b 1` | 7840 / 6208, unchanged | 56,136.890 → 52,226.522 µs (−7.0%) | 5899.15 → 5668.23 mJ |
 
-KV tasks are unchanged in every run. The refwalk runner reproduces Fix 5's `DDR5-M4-R4-C8` b1 run
+KV tasks are unchanged in every run. The patched-in Fix 5 walker reproduces Fix 5's `DDR5-M4-R4-C8` b1 run
 exactly (31,705.794 µs).
 
 ### Impact on results
@@ -763,6 +772,22 @@ Delete `graph_cache/` or bump `CACHE_VERSION` after changing allocation, graph o
 
 ---
 
+## End-to-end check after all fixes
+
+Five AE configs, run exactly as the AE scripts run them (`run.py --simulate --optimization layer
+static_mapping --fused_attn --fused_qkv`). The pre-fix numbers are `reference/hierarchical_data.csv`.
+
+| Config | Checks | Result | Pre-fix reference | Change |
+|---|---|---|---|---|
+| LLAMA2-7B `DDR5-M4-R4-C8` 128/128 b1 | basic run | 224.557 ms | 221.710 ms | +1.3% |
+| same, run again | loads the cached graph | 224.557 ms, identical | — | — |
+| LLAMA2-7B `DDR5-M4-R4-C8` 128/128 b8 | batches on both KV ranks | 552.126 ms | 552.561 ms | −0.1% |
+| MISTRAL-7B `DDR5-M8-R4-C8` 2048/128 b4 | GQA, long prefill | 2,201.709 ms | 2,242.909 ms | −1.8% |
+| LLAMA2-7B `DDR5-M1-R4-C8` 2048/128 b4 | one channel, tight capacity | 8,945.365 ms | 9,016.917 ms | −0.8% |
+| LLAMA2-7B `DDR5-M4-R2-C4` 2048/2048 b8 (`large1:16`) | must not fit | stops with the `temp_tensor_kv` capacity error | 44,819.880 ms | refuses (Fix 4) |
+
+---
+
 ## Known issues (not fixed)
 
 - **GDDR6 / DDR4 latency is sensitive to how weights split across channels** (see Fix 6,
@@ -778,3 +803,6 @@ Delete `graph_cache/` or bump `CACHE_VERSION` after changing allocation, graph o
 - **Two AE configs stop with an error by design** (Fix 4): `params/ispass_ae_large1.txt`
   lines 12 and 16 (LLAMA2-7B, b8, 2048/2048). The KV cache fills its ranks and leaves no room for
   the temp tensors.
+- **`reference/hierarchical_data.csv` predates these fixes.** AE results from this branch differ
+  from it by up to about 2%, and the two configs above have no result. Regenerate it from a full
+  AE run on this branch.

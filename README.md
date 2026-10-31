@@ -65,6 +65,15 @@ python3 run.py \
     --optimization layer static_mapping \
 ```
 
+### Notes
+- **Graph cache.** The built graph is cached in `graph_cache/`, keyed by the run arguments that
+  change it and by `CACHE_VERSION` in `utils/cache.py`. After changing allocation, graph-building
+  or task-mapping code, bump `CACHE_VERSION` or empty `graph_cache/`. Pass `--no_cache` to always rebuild.
+- **Capacity errors.** A run stops with a `ValueError` when its KV cache, weights or temporary
+  tensors do not fit in the DRAM config. Use a smaller batch or sequence length, or a larger config.
+- Fixes to KV/weight placement and their effect on results are described in
+  [`docs/bugfixes/kv_rank_allocation.md`](docs/bugfixes/kv_rank_allocation.md).
+
 ## Publication
 **ISPASS 2026**  
 *HARMONI: Hierarchical ARchitecture MOdeling for LLMs with Near/In Memory Computing*  

@@ -160,7 +160,7 @@ calls `get_tensor_locations`. The repo's `.sh` scripts do not pass `--no_cache`,
 fixes only take effect after those pickles are deleted, or with `--no_cache`. The cache
 filename (`utils/cache.py:get_model_dfg_cache_filename`) also ignores `--fused_attn` and
 `--fused_qkv`: `fusion_suffix` is computed but not used. As a result, runs that differ only
-in those flags share one pickle.
+in those flags share one pickle. Fixed in Fix 7.
 
 ---
 
@@ -709,3 +709,72 @@ exactly (31,705.794 µs).
 - `temp_tensor_wt` placement does not affect timing (`get_temp_tensor_locations` uses the DFG
   tensor's size, as for `temp_tensor_kv`).
 - Partial head groups only exist without `--fused_qkv`; every AE script passes `--fused_qkv`.
+
+---
+
+## Fix 7 — Graph cache reused pickles across code versions and flags
+
+**TL;DR:** the cached graph (`graph_cache/*.pkl`) holds the finished allocation and task
+mapping, and a run that finds a matching filename skips building it. The filename left out
+the code version and four flags that change the graph, so a run could silently load a graph
+built by the pre-fix code or with different flags. The filename now carries a short flag tag
+and a cache version.
+
+### Why it happened
+The filename had model, DRAM, dtype, `-i`, `-o`, `-b`, the `layer` optimization and the
+buffer size. It was missing:
+- **Code version.** A pickle from before Fixes 1-6 had the same name as one built after.
+  The `.sh` scripts do not pass `--no_cache`, so they would load the old, buggy addresses.
+- **`--fused_qkv`, `--fused_attn`** (read in `model_weight.py` and `transformer_dfg.py`).
+  The code computed a single `fused_attn AND fused_qkv` bit, which cannot tell "only
+  `--fused_qkv`" from "neither", and then never added it to the name.
+- **`--optimization static_mapping` and `GPU-Emb-Unemb`** (read in `task_mapping.py`).
+
+Args read only after the cache load are safe to mix and stay out of the name:
+`--no_systolic_array` and `--systolic_height` (timing is recomputed every run),
+`--headsplit` (always on), and the output-only flags (`--dump_*`, `--visualize`,
+`--verbose`, `--timing`, `--profile`).
+
+### The fix
+```
+CACHE_VERSION = 2          # bump whenever allocation, graph building or task mapping changes
+
+get_graph_flags(args):     # letters for the graph-changing flags that are on
+    q = --fused_qkv, a = --fused_attn, s = static_mapping, g = GPU-Emb-Unemb
+
+filename = .../{model}_{dram}_{dtype}_{i}i_{o}o_B{b}{_layer_opt}{_buffer}_{flags}_v{CACHE_VERSION}.pkl
+```
+An AE run's pickle goes from `..._B8_layer_opt.pkl` to `..._B8_layer_opt_qas_v2.pkl`.
+
+### Validation
+Default run (`DDR5-M4-R4-C8`, `-i 32 -o 16 -b 1`, `layer static_mapping`, both fused flags):
+
+| Run | Cache | Latency | Energy |
+|---|---|---|---|
+| Cold (empty `graph_cache/`) | miss, saves `..._layer_opt_qas_v2.pkl` | 31,705.794 µs | 3342.07 mJ |
+| Warm (same args) | hit | 31,705.794 µs | 3342.07 mJ |
+| Same without `--fused_attn` | miss, saves `..._layer_opt_qs_v2.pkl` | 31,775.323 µs | 3342.07 mJ |
+
+With the old filename, the third run would have loaded the fused graph and reported 31,705.794 µs.
+
+### Impact on results
+None for a single run. Old pickles (pre-fix, no `_v2`) can no longer be loaded by mistake.
+Delete `graph_cache/` or bump `CACHE_VERSION` after changing allocation, graph or mapping code.
+
+---
+
+## Known issues (not fixed)
+
+- **GDDR6 / DDR4 latency is sensitive to how weights split across channels** (see Fix 6,
+  Impact). When a weight tensor is not a whole number of channel sweeps, channels get up to
+  ~2.3% more or less data. Task mapping rounds each location's share of output columns up
+  (`ceil(N · size / tensor_size)`, so the shares add up to more than N), and
+  `GEMV_latency_energy` rounds again per bank (`ceil(N / total_banks)`). Together they can turn
+  that small imbalance into a 2× GEMV on the slowest channel. After Fix 6, LLAMA2-7B b1 moves
+  +7.8% on `GDDR6-M8-R4-C8` and −7.0% on `DDR4-M8-R4-C8`. This comes from the model's rounding,
+  not from the memory technology, so treat GDDR6/DDR4 latencies with care. DDR5 (every AE config)
+  is not affected. A fix would split N across locations exactly and/or count bytes per bank instead
+  of whole columns. That is a modelling decision and is left for later.
+- **Two AE configs stop with an error by design** (Fix 4): `params/ispass_ae_large1.txt`
+  lines 12 and 16 (LLAMA2-7B, b8, 2048/2048). The KV cache fills its ranks and leaves no room for
+  the temp tensors.

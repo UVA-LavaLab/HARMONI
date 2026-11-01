@@ -5,7 +5,7 @@ from modeling.core.model_weight import ModelWeightInfo
 from modeling.core.dram_info import dram
 from modeling.core.memory_system import memsys
 from config.model_config import make_model_config
-from utils.cache import load_model_dfg, save_model_dfg
+from utils.cache import load_model_dfg, save_model_dfg, get_graph_flags
 from modeling.report.stats_dumper import StatsDumper
 from simulation.helpers import (
     check_capacity, setup_simulation_context, run_core_analysis, build_and_map_dfg
@@ -54,6 +54,7 @@ def start_simulation(args):
         # Determine optimization flags
         layer_optimization = 'layer' in args.optimization
         fusion_enabled = 1 if (args.fused_attn and args.fused_qkv) else 0
+        graph_flags = get_graph_flags(args)
         
         # Try to load from cache
         use_cache = not getattr(args, 'no_cache', False)
@@ -67,10 +68,10 @@ def start_simulation(args):
         if use_cache:
             model_dfg = load_model_dfg(
                 args.model_name, args.dram, args.dtype, args.input_tokens,
-                args.output_tokens, args.batch, layer_optimization, fusion_enabled, args.buffer
+                args.output_tokens, args.batch, layer_optimization, graph_flags, args.buffer
             )
             if model_dfg is not None:
-                logger.info(f"[CACHE] Loaded model_dfg from cache (layer_opt={layer_optimization}, fusion_enabled={fusion_enabled}). Skipping graph construction and mapping.")
+                logger.info(f"[CACHE] Loaded model_dfg from cache (layer_opt={layer_optimization}, graph_flags={graph_flags!r}). Skipping graph construction and mapping.")
                 # Run core analysis (common to both paths)
                 run_core_analysis(model_dfg, dram, memsys, filename_str, args, None)
                 
@@ -100,7 +101,7 @@ def start_simulation(args):
             
             # Save to cache before simulation/analysis
             save_model_dfg(model_dfg, args.model_name, args.dram, args.dtype, args.input_tokens,
-                  args.output_tokens, args.batch, layer_optimization, fusion_enabled, args.buffer)
+                  args.output_tokens, args.batch, layer_optimization, graph_flags, args.buffer)
         
         # Run core analysis (common to both paths)
         run_core_analysis(model_dfg, dram, memsys, filename_str, args, timer)

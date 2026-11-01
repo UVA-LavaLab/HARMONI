@@ -1,9 +1,8 @@
 from misc.type import *
 from utils.logging_util import logger
-from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, calculate_batch_round_robin_rank
+from modeling.core.dram_utils import get_mapping as get_mapping_from_dram, get_accesses as get_accesses_from_dram, add_to_address_skipping_rank, kv_request_address_step, weight_request_address_step, weight_carried_rank_bits
 from collections import defaultdict
 import math
-import re
 
 #CLEANUP: if required - model should be a class which can be imported here
 
@@ -133,21 +132,6 @@ class HarmoniTensor:
         )
         return tensor_key
     
-    @staticmethod
-    def extract_batch_idx_from_name(tensor_name):
-        """
-        Extract batch index from tensor name.
-        KV tensor names follow pattern: t_kcache_head{h}_batch{b} or t_kcache_b{b}_l{l}_h{h}
-        Returns batch_idx if found, -1 otherwise.
-        """
-        match1 = re.search(r'_batch(\d+)', tensor_name)
-        match2 = re.search(r'_b(\d+)_', tensor_name)
-        if match1:
-            return int(match1.group(1))
-        if match2:
-            return int(match2.group(1))
-        return -1   
-    
     @staticmethod   
     def get_tensor_locations(tensor, dram):
         """
@@ -175,16 +159,36 @@ class HarmoniTensor:
         # Calculate number of partitions needed for this tensor
         num_partitions = math.ceil(tensor_size / partition_size)
         chip_partition_size = partition_size // num_chips    
+        # Address distance between consecutive chip-partitions. One chip-partition is one allocator request (one Co
+        # step, 0x100 on DDR5), not chip_partition_size address units (512 on DDR5, 1024 on GDDR6), which skipped
+        # columns and ran past the tensor's reservation into the next one. KV and weight allocators order their
+        # fields differently (KV: Co -> Ch -> Ro, Ra pinned; weight: Co -> Ra (weight ranks) -> Ch -> Ro), so each
+        # tag takes its step, and the carry rule below, from its own allocator
+        if tensor.tag == HarmoniTensorType.KV:
+            addr_step = kv_request_address_step(dram)
+        elif tensor.tag == HarmoniTensorType.WEIGHT:
+            addr_step = weight_request_address_step(dram)
+        else:
+            addr_step = chip_partition_size
              
         for i in range(num_partitions*num_chips):
             
             if tensor.chip_idx == -1: # Tensor is spread across all chips in the rank
                 chip = i % num_chips
-                addr = int(tensor.addr_offset) + int((i // num_chips) * chip_partition_size) 
+                step = int((i // num_chips) * addr_step)
             else:
                 chip = tensor.chip_idx
-                addr = int(tensor.addr_offset) + int(i * chip_partition_size)
-            
+                step = int(i * addr_step)
+
+            if tensor.tag == HarmoniTensorType.KV:
+                # KV rank is pinned by batch round-robin: carries must skip the Ra field, not spill into it
+                addr = add_to_address_skipping_rank(int(tensor.addr_offset), step, dram)
+            elif tensor.tag == HarmoniTensorType.WEIGHT:
+                # Weights count through the weight ranks only: carries skip the Ra bits that select KV ranks
+                addr = add_to_address_skipping_rank(int(tensor.addr_offset), step, dram, weight_carried_rank_bits(dram))
+            else:
+                addr = int(tensor.addr_offset) + step
+
             
             partition_mapping = get_mapping_from_dram(int(addr), dram, "weight" if tensor.tag == HarmoniTensorType.WEIGHT else "kv") #NOTE: Should also work for ACT tensor since get_mapping is not using rank_type. Also, get_mapping for ACT tensor is done later!
 
@@ -200,25 +204,16 @@ class HarmoniTensor:
             
             # Respect the tensor's tag when determining rank type
             if tensor.tag == HarmoniTensorType.WEIGHT:
-                rank = rank % dram.num_wt_ranks_per_channel
+                # The walk follows the weight allocator, so Ra is always a weight rank; a KV rank here would be
+                # folded onto a weight rank's logic unit, so fail loudly instead
+                if rank >= dram.num_wt_ranks_per_channel:
+                    raise ValueError(f"Weight tensor {tensor.name} decoded to KV rank Ra={rank} at addr 0x{addr:x}")
             elif tensor.tag == HarmoniTensorType.KV:
-                # Check if rank bits wrapped around to a weight rank due to address interleaving
+                # Ra is pinned to the batch's KV rank; never write to partition_mapping (shared lru_cache dict).
+                # A weight rank here would give a negative kv_rank that silently matches no logic unit, so fail loudly.
                 if rank < dram.num_wt_ranks_per_channel:
-                    # Extract batch index from tensor name to determine correct KV rank
-                    batch_idx = HarmoniTensor.extract_batch_idx_from_name(tensor.name)
-                    if batch_idx >= 0:
-                        # Use round-robin determined KV rank
-                        target_kv_rank = calculate_batch_round_robin_rank(batch_idx, dram)
-                        rank_value = dram.num_wt_ranks_per_channel + target_kv_rank
-                        # Override the rank component in the mapping
-                        partition_mapping['Ra'] = rank_value
-                        # Convert to KV rank index (0-based within KV ranks)
-                        rank = target_kv_rank
-                    else:
-                        logger.error(f"KV tensor {tensor.name} mapped to weight rank (tensor={tensor.name} batch={batch_idx} Ra={rank}) but could not extract batch_idx from name")
-                else:
-                    # Rank is already in KV range, convert to KV rank index
-                    rank = rank - dram.num_wt_ranks_per_channel
+                    raise ValueError(f"KV tensor {tensor.name} decoded to weight rank Ra={rank} at addr 0x{addr:x}")
+                rank = rank - dram.num_wt_ranks_per_channel
 
             key = (channel, rank, chip)
             
@@ -231,11 +226,11 @@ class HarmoniTensor:
 
             if key not in partition_map:
                 # First time this key is seen: set size, start_addr, end_addr
-                partition_map[key] = (chip_partition_size, addr, addr + chip_partition_size) #NOTE: Do not get mapping from this partition end_addr 
+                partition_map[key] = (chip_partition_size, addr, addr + addr_step) #NOTE: Do not get mapping from this partition end_addr 
             else:
                 prev_size, start_addr, prev_end_addr = partition_map[key]
                 # Update size and end_addr
-                partition_map[key] = (prev_size + chip_partition_size, start_addr, addr + chip_partition_size)
+                partition_map[key] = (prev_size + chip_partition_size, start_addr, addr + addr_step)
 
         # Convert back to list of (location_dict, size, start_addr, end_addr)
         merged_locations = []
